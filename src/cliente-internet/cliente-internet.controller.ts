@@ -10,24 +10,32 @@ import {
   Query,
   Res,
   ValidationPipe,
+  Logger,
 } from '@nestjs/common';
-import { Response } from 'express';
 import { ClienteInternetService } from './cliente-internet.service';
 import { CreateClienteInternetDto } from './dto/create-cliente-internet.dto';
 import { UpdateClienteInternetDto } from './dto/update-cliente-internet.dto';
-// import { JwtAuthGuard } from 'src/auth/JwtGuard/JwtAuthGuard';
-import { GetUserAuthToken } from 'src/CustomDecoratorAuthToken/GetUserAuthToken';
-import { GetToken } from 'src/auth/JwtGuard/getUserDecorator';
 import { updateCustomerService } from './dto/update-customer-service';
 import { GetClientesRutaQueryDto } from './pagination/cliente-internet.dto';
-// import { IdContratoService } from 'src/id-contrato/id-contrato.service';
+import { NetworkServiceService } from 'src/network-service/network-service.service';
+import { GetCustomersQueryDto } from './dto/query-table';
+import { CustomersCampaingQuery } from './query/customers-campaing-query.dto';
 
 @Controller('internet-customer')
 export class ClienteInternetController {
+  private readonly logger = new Logger(ClienteInternetService.name);
+
   constructor(
     private readonly clienteInternetService: ClienteInternetService,
+
+    private readonly networkService: NetworkServiceService,
   ) {}
 
+  /**
+   * CREAR CLIENTE
+   * @param createClienteInternetDto
+   * @returns
+   */
   @Post('/create-new-customer')
   create(@Body() createClienteInternetDto: CreateClienteInternetDto) {
     return this.clienteInternetService.create(createClienteInternetDto);
@@ -40,38 +48,10 @@ export class ClienteInternetController {
 
   @Get('/customer-to-table')
   findCustomersToTable(
-    @Query('page') page: string,
-    @Query('limite') limite: string,
-    @Query('paramSearch') paramSearch: string,
-
-    //otros filtros
-    @Query('zonasFacturacionSelected') zonasFacturacionSelected: string,
-    @Query('muniSelected') muniSelected: string,
-    @Query('depaSelected') depaSelected: string,
-    @Query('sectorSelected') sectorSelected: string,
-    //nuevo state
-    @Query('estadoSelected') estadoSelected: string,
+    @Query(new ValidationPipe({ transform: true }))
+    queryParams: GetCustomersQueryDto,
   ) {
-    const pageNumber = parseInt(page, 10) || 1;
-    const limit = parseInt(limite, 10) || 1;
-    //otros filtros
-    const zona = parseInt(zonasFacturacionSelected, 10) || null;
-    const municipio = parseInt(muniSelected, 10) || null;
-    const departamento = parseInt(depaSelected, 10) || null;
-    const sector = parseInt(sectorSelected, 10) || null;
-    const estado = estadoSelected || null;
-
-    return this.clienteInternetService.findCustomersToTable(
-      pageNumber,
-      limit,
-      paramSearch,
-      //otro
-      zona,
-      municipio,
-      departamento,
-      sector,
-      estado,
-    );
+    return this.clienteInternetService.findCustomersToTable(queryParams);
   }
 
   @Get('/get-customer-details/:id')
@@ -89,6 +69,20 @@ export class ClienteInternetController {
     return this.clienteInternetService.findCustomersToTicket();
   }
 
+  @Get('/whatsapp-campaing')
+  getCustomersToWhatsappCampaing(
+    @Query(new ValidationPipe({ transform: true }))
+    queryParams: CustomersCampaingQuery,
+  ) {
+    this.logger.log(
+      `queryParams recibido:\n${JSON.stringify(queryParams, null, 2)}`,
+    );
+    return this.clienteInternetService.getCustomersWhatsappCampaing(
+      queryParams,
+    );
+  }
+
+  // COMENTARIO DE ULTIMO COMMIT
   @Get('/get-customers-ruta')
   getCustomersToRuta(
     @Query(
@@ -100,6 +94,10 @@ export class ClienteInternetController {
     )
     q: GetClientesRutaQueryDto,
   ) {
+    this.logger.log(
+      `El query enviado desde la tabla es:\n${JSON.stringify(q, null, 2)}`,
+    );
+
     return this.clienteInternetService.getCustomersToRuta(q);
   }
 
@@ -113,6 +111,11 @@ export class ClienteInternetController {
     return this.clienteInternetService.deleteClientsWithRelations();
   }
 
+  /**
+   * ELIMINACION COMPLETA DEL CLIENTE
+   * @param id
+   * @returns
+   */
   @Delete('/delete-one-customer/:id')
   remove(@Param('id', ParseIntPipe) id: number) {
     return this.clienteInternetService.removeOneCustomer(id);
@@ -126,19 +129,22 @@ export class ClienteInternetController {
   }
 
   /**
-   * ACTUALIZAR CLIENTE
+   * ACTUALIZAR CLIENTE (SIN ALTERAR MK)
    * @param updateCustomerService DTO de nuevoc cambios
    * @param id
    * @returns
    */
   @Patch('/update-customer/:id')
-  updateClienteInternet(
+  async updateClienteInternet(
     @Body() updateCustomerService: UpdateClienteInternetDto,
     @Param('id', ParseIntPipe) id: number,
   ) {
-    return this.clienteInternetService.updateClienteInternet(
+    const result = await this.clienteInternetService.updateClienteInternet(
       id,
       updateCustomerService,
     );
+
+    // await this.networkService.syncCustomerNetwork(id);
+    return result;
   }
 }

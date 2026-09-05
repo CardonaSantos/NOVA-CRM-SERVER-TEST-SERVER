@@ -10,8 +10,6 @@ import { CategoriaNotificacion } from '@prisma/client';
 
 @Injectable()
 export class NotificacionesService {
-  private readonly logger = new Logger(NotificacionesService.name);
-
   constructor(
     @Inject(NOTIFICATION_REPOSITORY)
     private readonly notificationRepo: NotificationRepository,
@@ -34,7 +32,7 @@ export class NotificacionesService {
     botsNotifications: Notificacion[];
     notifications: Notificacion[];
   }> {
-    const records = await this.notificationRepo.findMany();
+    const records = await this.notificationRepo.findMany({});
 
     const botsNotifications = records.filter(
       (not) => not.categoria === CategoriaNotificacion.BOT,

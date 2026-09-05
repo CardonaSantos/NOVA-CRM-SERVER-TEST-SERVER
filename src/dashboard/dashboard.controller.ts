@@ -1,5 +1,30 @@
-import { Controller, Get, Param, Delete, ParseIntPipe } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  Delete,
+  ParseIntPipe,
+  Req,
+  BadRequestException,
+  UseGuards,
+  UsePipes,
+  ValidationPipe,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { DashboardService } from './dashboard.service';
+import { JwtAuthGuard } from 'src/auth/JwtGuard/jwt-auth.guard';
+
+type AuthenticatedRequest = Request & {
+  user?: {
+    id?: number | string;
+    sub?: number | string;
+    userId?: number | string;
+
+    empresaId?: number | string;
+
+    nombre?: string;
+  };
+};
 
 @Controller('dashboard')
 export class DashboardController {
@@ -72,5 +97,27 @@ export class DashboardController {
   @Get('/cobros')
   getTopMorososDashboard() {
     return this.dashboardService.getTopMorososDashboard();
+  }
+
+  /**
+   * Panel operativo del técnico autenticado.
+   *
+   * El ID se obtiene exclusivamente del JWT validado.
+   * No se recibe técnicoId por params, query ni body.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Get('panel-tecnico')
+  async getDashboardPanelTecnico(@Req() req: AuthenticatedRequest) {
+    const rawTecnicoId = req.user?.id ?? req.user?.sub ?? req.user?.userId;
+
+    const tecnicoId = Number(rawTecnicoId);
+
+    if (!Number.isInteger(tecnicoId) || tecnicoId <= 0) {
+      throw new UnauthorizedException(
+        'No fue posible identificar al técnico autenticado.',
+      );
+    }
+
+    return this.dashboardService.get_dashboard_panel_tecnico(tecnicoId);
   }
 }

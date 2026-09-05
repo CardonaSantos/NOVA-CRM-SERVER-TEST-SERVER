@@ -4,18 +4,444 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import * as dayjs from 'dayjs';
-import * as utc from 'dayjs/plugin/utc';
-import * as timezone from 'dayjs/plugin/timezone';
+import { dayjs } from 'src/Utils/dayjs.config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { throwFatalError } from 'src/Utils/CommonFatalError';
 import { TZ } from 'src/Utils/tzgt';
-dayjs.extend(utc);
-dayjs.extend(timezone);
+import { EstadoInstalacionCliente } from 'src/modules/cliente-instalacion/domain/enums/estado-instalacion-cliente.enum';
+import { EstadoTicketSoporte, Prisma } from '@prisma/client';
+import {
+  average,
+  buildMonthlyActivity,
+  getDashboardRangesGuatemala,
+  getMaximumActivityDay,
+  getMinimumActivityDay,
+  getMinutesBetween,
+  getTicketResolutionDate,
+  isFiniteNumber,
+  round,
+} from './dashboard-tecnico.utils';
+import { isDate } from 'util/types';
+
+const TICKET_ESTADOS_TERMINALES: EstadoTicketSoporte[] = [
+  EstadoTicketSoporte.RESUELTA,
+  EstadoTicketSoporte.CERRADO,
+  EstadoTicketSoporte.CANCELADA,
+  EstadoTicketSoporte.ARCHIVADA,
+];
+
+const INSTALACION_ESTADOS_ACTIVOS: EstadoInstalacionCliente[] = [
+  EstadoInstalacionCliente.PROGRAMADA,
+  EstadoInstalacionCliente.REPROGRAMADA,
+  EstadoInstalacionCliente.EN_PROCESO,
+];
+
 @Injectable()
 export class DashboardService {
   private logger = new Logger(DashboardService.name);
   constructor(private readonly prisma: PrismaService) {}
+
+  async get_dashboard_panel_tecnico(tecnicoId: number) {
+    const ahora = new Date();
+
+    const {
+      year,
+      month,
+      day,
+      inicioMes,
+      finMes,
+      inicioHoy,
+      finHoy,
+      diasTranscurridos,
+    } = getDashboardRangesGuatemala(ahora);
+
+    const hace48Horas = new Date(ahora.getTime() - 48 * 60 * 60 * 1000);
+
+    const participacionTicketWhere = {
+      OR: [
+        {
+          tecnicoId,
+        },
+        {
+          asignaciones: {
+            some: {
+              tecnicoId,
+            },
+          },
+        },
+      ],
+    } satisfies Prisma.TicketSoporteWhereInput;
+
+    const asignacionInstalacionWhere = {
+      tecnicos: {
+        some: {
+          tecnicoId,
+        },
+      },
+    } satisfies Prisma.ClienteInstalacionWhereInput;
+
+    const ticketsActivosWhere = {
+      AND: [
+        participacionTicketWhere,
+        {
+          estado: {
+            notIn: ['CERRADO', 'RESUELTA', 'CANCELADA'],
+          },
+        },
+      ],
+    } satisfies Prisma.TicketSoporteWhereInput;
+
+    const ticketsListosWhere = {
+      AND: [
+        participacionTicketWhere,
+        {
+          estado: {
+            notIn: ['CERRADO', 'RESUELTA', 'CANCELADA', 'PENDIENTE_CLIENTE'],
+          },
+        },
+      ],
+    } satisfies Prisma.TicketSoporteWhereInput;
+
+    const instalacionesActivasWhere = {
+      AND: [
+        asignacionInstalacionWhere,
+        {
+          estado: {
+            in: ['PROGRAMADA', 'REPROGRAMADA', 'EN_PROCESO'],
+          },
+        },
+      ],
+    } satisfies Prisma.ClienteInstalacionWhereInput;
+
+    const ticketsResueltosMesWhere = {
+      AND: [
+        participacionTicketWhere,
+        {
+          estado: 'RESUELTA',
+        },
+        {
+          OR: [
+            {
+              fechaResolucionTecnico: {
+                gte: inicioMes,
+                lt: finMes,
+              },
+            },
+            {
+              fechaCierre: {
+                gte: inicioMes,
+                lt: finMes,
+              },
+            },
+            {
+              asignaciones: {
+                some: {
+                  tecnicoId,
+                  resolvioEn: {
+                    gte: inicioMes,
+                    lt: finMes,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    } satisfies Prisma.TicketSoporteWhereInput;
+
+    const instalacionesCompletadasMesWhere = {
+      AND: [
+        {
+          estado: 'COMPLETADA',
+        },
+        {
+          fechaFinalizacion: {
+            gte: inicioMes,
+            lt: finMes,
+          },
+        },
+        {
+          OR: [
+            {
+              completadoPorId: tecnicoId,
+            },
+            asignacionInstalacionWhere,
+          ],
+        },
+      ],
+    } satisfies Prisma.ClienteInstalacionWhereInput;
+
+    const [
+      tecnico,
+
+      ticketsPendientes,
+      ticketsListosParaTrabajar,
+      ticketsUrgentes,
+      ticketsConMas48Horas,
+
+      instalacionesPendientes,
+      instalacionesProgramadasHoy,
+      instalacionesAtrasadas,
+
+      ticketsResueltosMes,
+      instalacionesCompletadasMes,
+    ] = await Promise.all([
+      this.prisma.usuario.findUnique({
+        where: {
+          id: tecnicoId,
+        },
+        select: {
+          id: true,
+          nombre: true,
+          correo: true,
+          rol: true,
+          activo: true,
+        },
+      }),
+
+      this.prisma.ticketSoporte.count({
+        where: ticketsActivosWhere,
+      }),
+
+      this.prisma.ticketSoporte.count({
+        where: ticketsListosWhere,
+      }),
+
+      this.prisma.ticketSoporte.count({
+        where: {
+          AND: [
+            ticketsActivosWhere,
+            {
+              prioridad: 'URGENTE',
+            },
+          ],
+        },
+      }),
+
+      this.prisma.ticketSoporte.count({
+        where: {
+          AND: [
+            ticketsActivosWhere,
+            {
+              fechaApertura: {
+                lt: hace48Horas,
+              },
+            },
+          ],
+        },
+      }),
+
+      this.prisma.clienteInstalacion.count({
+        where: instalacionesActivasWhere,
+      }),
+
+      this.prisma.clienteInstalacion.count({
+        where: {
+          AND: [
+            instalacionesActivasWhere,
+            {
+              fechaProgramada: {
+                gte: inicioHoy,
+                lt: finHoy,
+              },
+            },
+          ],
+        },
+      }),
+
+      this.prisma.clienteInstalacion.count({
+        where: {
+          AND: [
+            instalacionesActivasWhere,
+            {
+              fechaProgramada: {
+                lt: inicioHoy,
+              },
+            },
+          ],
+        },
+      }),
+
+      /*
+       * Solo se seleccionan las fechas necesarias para:
+       * - calcular duración;
+       * - agrupar por día.
+       */
+      this.prisma.ticketSoporte.findMany({
+        where: ticketsResueltosMesWhere,
+        select: {
+          id: true,
+          fechaApertura: true,
+          fechaAsignacion: true,
+          fechaInicioAtencion: true,
+          fechaResolucionTecnico: true,
+          fechaCierre: true,
+
+          asignaciones: {
+            where: {
+              tecnicoId,
+            },
+            select: {
+              resolvioEn: true,
+              tiempoTecnicoMinutos: true,
+            },
+          },
+        },
+      }),
+
+      this.prisma.clienteInstalacion.findMany({
+        where: instalacionesCompletadasMesWhere,
+        select: {
+          id: true,
+          fechaProgramada: true,
+          fechaInicio: true,
+          fechaFinalizacion: true,
+
+          tecnicos: {
+            where: {
+              tecnicoId,
+            },
+            select: {
+              tiempoMinutos: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    if (!tecnico) {
+      throw new NotFoundException('El técnico no existe');
+    }
+
+    const tiemposResolucionTicket = ticketsResueltosMes
+      .map((ticket) => {
+        /*
+         * Inicio preferido:
+         * 1. Inicio real de atención.
+         * 2. Asignación.
+         * 3. Apertura.
+         */
+        const inicio =
+          ticket.fechaInicioAtencion ??
+          ticket.fechaAsignacion ??
+          ticket.fechaApertura;
+
+        /*
+         * Final preferido:
+         * 1. Resolución técnica.
+         * 2. Cierre.
+         * 3. Resolución registrada en su asignación.
+         */
+        const final =
+          ticket.fechaResolucionTecnico ??
+          ticket.fechaCierre ??
+          ticket.asignaciones[0]?.resolvioEn ??
+          null;
+
+        return getMinutesBetween(inicio, final);
+      })
+      .filter(isFiniteNumber);
+
+    const tiemposInstalacion = instalacionesCompletadasMes
+      .map((instalacion) => {
+        const tiempoRegistrado = instalacion.tecnicos[0]?.tiempoMinutos;
+
+        if (typeof tiempoRegistrado === 'number' && tiempoRegistrado >= 0) {
+          return tiempoRegistrado;
+        }
+
+        return getMinutesBetween(
+          instalacion.fechaInicio ?? instalacion.fechaProgramada,
+          instalacion.fechaFinalizacion,
+        );
+      })
+      .filter(isFiniteNumber);
+
+    const actividadDiaria = buildMonthlyActivity({
+      year,
+      month,
+      currentDay: day,
+
+      ticketDates: ticketsResueltosMes
+        .map(getTicketResolutionDate)
+        .filter(isDate),
+
+      installationDates: instalacionesCompletadasMes
+        .map((instalacion) => instalacion.fechaFinalizacion)
+        .filter(isDate),
+    });
+
+    const diasConActividad = actividadDiaria.filter((item) => item.total > 0);
+
+    const diaMasProductivo = getMaximumActivityDay(diasConActividad);
+
+    const diaMenosProductivoConActividad =
+      getMinimumActivityDay(diasConActividad);
+
+    const ticketsResueltos = ticketsResueltosMes.length;
+
+    const instalacionesCompletadas = instalacionesCompletadasMes.length;
+
+    const trabajosCompletados = ticketsResueltos + instalacionesCompletadas;
+
+    return {
+      tecnico,
+
+      periodo: {
+        inicioMes,
+        finMes,
+        diasTranscurridos,
+        zonaHoraria: 'America/Guatemala',
+      },
+
+      cargaActual: {
+        ticketsPendientes,
+        ticketsListosParaTrabajar,
+        ticketsUrgentes,
+        ticketsConMas48Horas,
+
+        instalacionesPendientes,
+        instalacionesProgramadasHoy,
+        instalacionesAtrasadas,
+      },
+
+      productividadMes: {
+        ticketsResueltos,
+        instalacionesCompletadas,
+        trabajosCompletados,
+        diasConActividad: diasConActividad.length,
+
+        promedioTicketsPorDia: round(ticketsResueltos / diasTranscurridos, 2),
+
+        /*
+         * Ritmo proyectado usando los días transcurridos:
+         * tickets / días * 7.
+         */
+        ritmoSemanalTickets: round(
+          (ticketsResueltos / diasTranscurridos) * 7,
+          2,
+        ),
+
+        promedioTrabajosPorDiaActivo:
+          diasConActividad.length > 0
+            ? round(trabajosCompletados / diasConActividad.length, 2)
+            : 0,
+      },
+
+      tiempos: {
+        promedioResolucionTicketMinutos: average(tiemposResolucionTicket),
+
+        promedioInstalacionMinutos: average(tiemposInstalacion),
+      },
+
+      resumenActividad: {
+        diaMasProductivo,
+        diaMenosProductivoConActividad,
+      },
+
+      actividadDiaria,
+    };
+  }
 
   async create() {}
 
@@ -143,6 +569,11 @@ export class DashboardService {
               contactoReferenciaTelefono: true,
               ubicacion: { select: { latitud: true, longitud: true } },
               medias: {
+                where: {
+                  categoria: {
+                    notIn: ['SOPORTE_TICKET'],
+                  },
+                },
                 select: {
                   id: true,
                   cdnUrl: true,
@@ -159,8 +590,10 @@ export class DashboardService {
       });
 
       const formattedTickets = rawTickets.map((t) => {
-        const loc = t.cliente.ubicacion;
-        const medias = (t.cliente.medias ?? []).map((media) => ({
+        const cliente = t.cliente;
+
+        const loc = cliente?.ubicacion ?? null;
+        const medias = (cliente?.medias ?? []).map((media) => ({
           id: media.id,
           titulo: media.titulo,
           descripcion: media.descripcion,
@@ -177,13 +610,18 @@ export class DashboardService {
           estado: t.estado,
           prioridad: t.prioridad,
           descripcion: t.descripcion,
-          clientId: t.cliente.id,
-          clienteNombre:
-            `${t.cliente.nombre ?? ''} ${t.cliente.apellidos ?? ''}`.trim(),
-          clienteTel: t.cliente.telefono,
-          referenciaContacto: t.cliente.contactoReferenciaTelefono,
-          direccion: t.cliente.direccion,
+
+          clientId: cliente?.id ?? null,
+          clienteNombre: cliente
+            ? `${cliente.nombre ?? ''} ${cliente.apellidos ?? ''}`.trim()
+            : 'SIN CLIENTE',
+
+          clienteTel: cliente?.telefono ?? null,
+          referenciaContacto: cliente?.contactoReferenciaTelefono ?? null,
+          direccion: cliente?.direccion ?? null,
+
           ubicacionMaps: loc ? { lat: loc.latitud, lng: loc.longitud } : null,
+
           medias,
         };
       });
@@ -236,6 +674,11 @@ export class DashboardService {
               observaciones: true,
 
               medias: {
+                where: {
+                  categoria: {
+                    notIn: ['SOPORTE_TICKET'],
+                  },
+                },
                 select: {
                   id: true,
                   cdnUrl: true,
@@ -806,81 +1249,77 @@ export class DashboardService {
   }
 
   /**
-   * RETORNO DE DATOS SIN
-   * @returns
+   * Obtiene los tickets en proceso y el conteo de tickets activos.
+   * @returns Objeto con métricas y lista de tickets formateada.
    */
   async getDashboardTicketProceso() {
     try {
-      const ticketsProceso = await this.prisma.ticketSoporte.findMany({
-        orderBy: {
-          actualizadoEn: 'desc',
-        },
-        where: {
-          estado: 'EN_PROCESO',
-        },
-        select: {
-          id: true,
-          titulo: true,
-          cliente: {
-            select: {
-              id: true,
-              nombre: true,
-            },
+      // OPTIMIZACIÓN: Ejecutamos ambas consultas en paralelo para mayor velocidad
+      const [ticketsProceso, ticketDisponibles] = await Promise.all([
+        this.prisma.ticketSoporte.findMany({
+          orderBy: {
+            actualizadoEn: 'desc',
           },
-          tecnico: {
-            select: {
-              id: true,
-              nombre: true,
-            },
+          where: {
+            estado: 'EN_PROCESO',
           },
-          asignaciones: {
-            select: {
-              tecnico: {
-                select: {
-                  id: true,
-                  nombre: true,
+          select: {
+            id: true,
+            titulo: true,
+            cliente: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+            tecnico: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+            asignaciones: {
+              select: {
+                tecnico: {
+                  select: {
+                    id: true,
+                    nombre: true,
+                  },
                 },
               },
             },
           },
-        },
-      });
-
-      const ticketDisponibles = await this.prisma.ticketSoporte.count({
-        where: {
-          estado: {
-            notIn: ['RESUELTA'],
+        }),
+        this.prisma.ticketSoporte.count({
+          where: {
+            estado: {
+              notIn: ['RESUELTA'],
+            },
           },
-        },
-      });
+        }),
+      ]);
 
-      // En tu getDashboardTicketProceso dentro del map:
+      // MAPEO SEGURO: Evita crasheos si cliente, tecnico o asignaciones son null
+      const formatted = ticketsProceso.map((t) => ({
+        id: t.id,
+        titulo: t.titulo,
+        cliente: t.cliente?.nombre ?? 'General / Sin Cliente', // <-- Aquí está la magia anti-crasheo
+        tecnico: t.tecnico?.nombre ?? 'Sin Asignar',
+        acompanantes:
+          t.asignaciones?.map((a) => a.tecnico?.nombre).filter(Boolean) ?? [],
+      }));
 
-      const formatted = ticketsProceso.map((t) => {
-        const ticket = {
-          id: t.id,
-          titulo: t.titulo,
-          cliente: t.cliente.nombre,
-          tecnico: t.tecnico ? t.tecnico.nombre : null,
-          acompanantes: t.asignaciones.map((a) => a.tecnico.nombre),
-        };
-
-        return ticket;
-      });
-
-      const objt = {
+      return {
         tickets: formatted,
         ticketsMetricas: {
-          enLinea: ticketDisponibles ?? 0,
+          enLinea: ticketDisponibles,
         },
       };
-
-      return objt;
     } catch (error) {
       throwFatalError(
         error,
         this.logger,
-        'Dashboard service -getDashboardTicketProceso',
+        'Dashboard service - getDashboardTicketProceso',
       );
     }
   }
@@ -908,10 +1347,14 @@ export class DashboardService {
         take: 10,
       });
 
+      const clienteIds = topMorososRaw
+        .map((factura) => factura.clienteId)
+        .filter((id): id is number => typeof id === 'number');
+
       const clientes = await this.prisma.clienteInternet.findMany({
         where: {
           id: {
-            in: topMorososRaw.map((f) => f.clienteId),
+            in: clienteIds,
           },
         },
         select: {
@@ -921,12 +1364,29 @@ export class DashboardService {
         },
       });
 
-      const formatted = topMorososRaw.map((c) => {
-        const cliente = clientes.find((cliente) => c.clienteId == cliente.id);
+      const clientesById = new Map(
+        clientes.map((cliente) => [cliente.id, cliente]),
+      );
+
+      const formatted = topMorososRaw.map((item) => {
+        const cliente = clientesById.get(item.clienteId);
+
+        if (!cliente) {
+          return {
+            id: item.clienteId,
+            nombre: `Cliente #${item.clienteId}`,
+            cantidad: item._count.id,
+          };
+        }
+
+        const nombreCompleto = `${cliente.nombre ?? ''} ${
+          cliente.apellidos ?? ''
+        }`.trim();
+
         return {
           id: cliente.id,
-          nombre: `${cliente.nombre ?? ''} ${cliente.apellidos ?? ''}`,
-          cantidad: c._count.id,
+          nombre: nombreCompleto || `Cliente #${cliente.id}`,
+          cantidad: item._count.id,
         };
       });
 
@@ -957,11 +1417,11 @@ export class DashboardService {
         },
       });
 
-      const rutasFormatted = rutasActualesAbiertas.map((r) => {
+      const rutasFormatted = rutasActualesAbiertas.map((ruta) => {
         return {
-          nombreRuta: r.nombreRuta,
-          cobrador: r.cobrador.nombre,
-          totalClientes: r.clientes.length,
+          nombreRuta: ruta.nombreRuta || `Ruta #${ruta.id}`,
+          cobrador: ruta.cobrador?.nombre ?? 'Sin cobrador',
+          totalClientes: ruta.clientes?.length ?? 0,
         };
       });
 
@@ -973,7 +1433,7 @@ export class DashboardService {
       throwFatalError(
         error,
         this.logger,
-        'Dashboard service -getDashboardTicketProceso',
+        'Dashboard service -getTopMorososDashboard',
       );
     }
   }

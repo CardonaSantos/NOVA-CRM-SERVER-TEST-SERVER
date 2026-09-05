@@ -7,304 +7,357 @@ import {
 } from '@nestjs/common';
 import { CreateClienteInternetDto } from './dto/create-cliente-internet.dto';
 import { UpdateClienteInternetDto } from './dto/update-cliente-internet.dto';
-import { UserTokenAuth } from 'src/auth/dto/userToken.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { updateCustomerService } from './dto/update-customer-service';
 import {
   CategoriaMedia,
   ClienteInternet,
   EstadoCliente,
+  EstadoCobranzaCliente,
   EstadoMedia,
   EstadoServicioMikrotik,
   Prisma,
   StateFacturaInternet,
 } from '@prisma/client';
-import * as dayjs from 'dayjs';
-import * as utc from 'dayjs/plugin/utc';
-import * as timezone from 'dayjs/plugin/timezone';
+
 import { IdContratoService } from 'src/id-contrato/id-contrato.service';
 import { periodoFrom } from 'src/facturacion/Utils';
-import ExcelJS from 'exceljs';
 import { GetClientesRutaQueryDto } from './pagination/cliente-internet.dto';
-import { calcularEstadoServicioMikrotik } from './helper/mikrotik-estado.helper';
 import { TZ } from 'src/Utils/tzgt';
 import { normalizarTexto } from 'src/Utils/normalizarTexto';
-import { SshMikrotikConnectionService } from 'src/ssh-mikrotik-connection/application/ssh-mikrotik-connection.service';
 import { throwFatalError } from 'src/Utils/CommonFatalError';
-import { MikrotikCryptoService } from 'src/ssh-mikrotik-connection/helpers/mikrotik-crypto.service';
-// Extiende dayjs con los plugins
-dayjs.extend(utc);
-dayjs.extend(timezone);
-dayjs.locale('es'); // Establece español como idioma predeterminado
+import { GetCustomersQueryDto } from './dto/query-table';
+import { SshMikrotikConnectionService } from 'src/ssh-mikrotik-connection/application/ssh-mikrotik-connection.service';
+import { ActivateCustomerDto } from 'src/ssh-mikrotik-connection/dto/activate-ssh-mikrotik.dto';
+import { VerifyCustomerService } from 'src/credito/verify-customer/app/verify-customer.service';
+import { dayjs } from 'src/Utils/dayjs.config';
+import { selectCustomerCampaignWhatsapp } from './select/select-customer';
+import { mapCustomersCampaingWhatsapp } from './common/mappers';
+import { CustomersCampaingQuery } from './query/customers-campaing-query.dto';
+
 const strip = (s: string) =>
   s
     .normalize('NFD')
     .replace(/\p{Diacritic}/gu, '')
     .toLowerCase();
-const formatearFecha = (fecha: string) => {
-  // Formateo en UTC sin conversión a local
-  return dayjs(fecha).format('DD/MM/YYYY');
-};
+
 const ACCENT_FROM = 'ÁÀÂÄÃáàâäãÉÈÊËéèêëÍÌÎÏíìîïÓÒÔÖÕóòôöõÚÙÛÜúùûüÇçÑñÝŸýÿ';
 const ACCENT_TO = 'AAAAAaaaaaEEEEeeeeIIIIiiiiOOOOOoooooUUUUuuuuCcNnYYyy';
 
-const ESTADOS_MK_ACTIVOS: EstadoServicioMikrotik[] = [
-  EstadoServicioMikrotik.ACTIVO,
-  EstadoServicioMikrotik.PENDIENTE_APLICAR, // si quieres considerar este como "activo"
-];
-
-const esServicioMikrotikActivo = (
-  estado: EstadoServicioMikrotik | null | undefined,
-) => !!estado && ESTADOS_MK_ACTIVOS.includes(estado);
+const esServicioMikrotikActivo = (estado?: EstadoServicioMikrotik) =>
+  estado === EstadoServicioMikrotik.ACTIVO;
 
 @Injectable()
 export class ClienteInternetService {
   private readonly logger = new Logger(ClienteInternetService.name);
   constructor(
     private readonly prisma: PrismaService,
-    private readonly sshMikrotikService: SshMikrotikConnectionService,
-    private readonly mkCrypto: MikrotikCryptoService,
-
     private readonly idContradoService: IdContratoService,
+    private readonly ssh: SshMikrotikConnectionService,
+    private readonly verifyCreditService: VerifyCustomerService,
   ) {}
 
-  async create(createClienteInternetDto: CreateClienteInternetDto) {
-    const {
-      coordenadas,
-      municipioId,
-      departamentoId,
-      empresaId,
-      servicesIds,
-      asesorId,
-      ip,
-      mascara,
-      gateway,
-      servicioWifiId,
-      zonaFacturacionId,
-      archivoContrato,
-      fechaFirma,
-      idContrato,
-      observacionesContrato,
-      sectorId,
-      estado,
+  async create(dto: CreateClienteInternetDto) {
+    try {
+      this.logger.log(`DTO recibido:\n${JSON.stringify(dto, null, 2)}`);
 
-      ...restoData
-    } = createClienteInternetDto;
+      const result = await this.createClienteTransactional(dto);
 
-    console.log('el sector id es: ', sectorId);
+      await this.handlePostCreationProcesses(dto, result.cliente.id);
 
-    const serviceIds: number[] = createClienteInternetDto.servicesIds;
-    const latitud = coordenadas?.[0] ? Number(coordenadas[0]) : null;
-    const longitud = coordenadas?.[1] ? Number(coordenadas[1]) : null;
+      return result;
+    } catch (error) {
+      throwFatalError(error, this.logger, 'ClienteInternetService.create');
+    }
+  }
 
-    const result = await this.prisma.$transaction(async (prisma) => {
-      let ubicacion = null;
-      const fullName =
-        `${createClienteInternetDto.nombre ?? ''} ${createClienteInternetDto.apellidos ?? ''}`.trim();
-      const nombreSearch = normalizarTexto(fullName);
-
-      // Si hay coordenadas válidas, se crea la ubicación
-      if (latitud !== null && longitud !== null) {
-        ubicacion = await prisma.ubicacion.create({
-          data: {
-            latitud,
-            longitud,
-            empresa: {
-              connect: { id: 1 },
-            },
-          },
-        });
-      }
-
-      const cliente = await prisma.clienteInternet.create({
-        data: {
-          ...restoData,
-          servicioInternet: servicioWifiId
-            ? { connect: { id: servicioWifiId } }
-            : undefined,
-          municipio: municipioId ? { connect: { id: municipioId } } : undefined,
-          departamento: departamentoId
-            ? { connect: { id: departamentoId } }
-            : undefined,
-          empresa: { connect: { id: empresaId } },
-          clienteServicios: {
-            create: serviceIds.map((id) => ({
-              servicio: { connect: { id } },
-              fechaInicio: createClienteInternetDto.fechaInstalacion,
-              estado: 'ACTIVO',
-            })),
-          },
-          asesor: asesorId ? { connect: { id: asesorId } } : undefined,
-          ubicacion: ubicacion ? { connect: { id: ubicacion.id } } : undefined,
-          apellidos: restoData.apellidos || null,
-          telefono: restoData.telefono || null,
-          direccion: restoData.direccion || null,
-          dpi: restoData.dpi || null,
-          observaciones: restoData.observaciones || null,
-          contactoReferenciaNombre: restoData.contactoReferenciaNombre || null,
-          contactoReferenciaTelefono:
-            restoData.contactoReferenciaTelefono || null,
-          ssidRouter: restoData.ssidRouter || null,
-          fechaInstalacion: restoData.fechaInstalacion || null,
-          searchNombre: nombreSearch,
-          estadoCliente: estado || 'ACTIVO',
-          facturacionZona: {
-            connect: {
-              id: zonaFacturacionId,
-            },
+  async asigneeMk(
+    clienteId: number,
+    mkSelected: number,
+    tx?: Prisma.TransactionClient,
+  ) {
+    let connection = await tx.clienteInternet.update({
+      where: {
+        id: clienteId,
+      },
+      data: {
+        MikrotikRouter: {
+          connect: {
+            id: mkSelected,
           },
         },
-      });
-
-      // Solo se actualiza la ubicación si fue creada
-      if (ubicacion) {
-        await prisma.ubicacion.update({
-          where: { id: ubicacion.id },
-          data: { clienteId: cliente.id },
-        });
-      }
-
-      const ipRecord = await prisma.iP.create({
-        data: {
-          direccionIp: ip,
-          gateway: gateway,
-          mascara: mascara,
-          cliente: { connect: { id: cliente.id } },
-        },
-      });
-
-      const saldoClienteInternet = await prisma.saldoCliente.create({
-        data: {
-          cliente: {
-            connect: {
-              id: cliente.id,
-            },
-          },
-        },
-      });
-
-      const fechaFacturacionZona = await prisma.facturacionZona.findUnique({
-        where: {
-          id: createClienteInternetDto.zonaFacturacionId,
-        },
-      });
-
-      const servicioClienteInternet = await prisma.servicioInternet.findUnique({
-        where: {
-          id: servicioWifiId,
-        },
-      });
-
-      if (!servicioClienteInternet) {
-        throw new Error('Servicio de internet no encontrado');
-      }
-
-      const fechaPrimerPago = fechaFacturacionZona.diaPago;
-      const fechaPrimerPagoInicial = dayjs().date(fechaPrimerPago);
-      const siguientePago = fechaPrimerPagoInicial.add(1, 'month');
-
-      const periodo = periodoFrom(fechaPrimerPagoInicial.toDate()); // o la fecha que uses
-      console.log('El periodo generando es: ', periodo);
-      const newFacturaInternetPrimerPago = await prisma.facturaInternet.create({
-        data: {
-          periodo: periodo,
-          fechaPagoEsperada: fechaPrimerPagoInicial.toDate(),
-          montoPago: servicioClienteInternet.precio,
-          saldoPendiente: servicioClienteInternet.precio,
-          empresa: {
-            connect: {
-              id: createClienteInternetDto.empresaId,
-            },
-          },
-          estadoFacturaInternet: 'PENDIENTE',
-          cliente: {
-            connect: {
-              id: cliente.id,
-            },
-          },
-          facturacionZona: {
-            connect: {
-              id: fechaFacturacionZona.id,
-            },
-          },
-          nombreClienteFactura: `${cliente.nombre}  ${cliente.apellidos}`,
-          detalleFactura: `Pago por suscripción mensual al servicio de internet, plan ${servicioClienteInternet.nombre} (${servicioClienteInternet.velocidad}), precio: ${servicioClienteInternet.precio} Fecha: ${formatearFecha(fechaPrimerPagoInicial.format())}`,
-        },
-      });
-
-      //ponerle el sado pendiente de la primera factura:
-
-      await prisma.saldoCliente.update({
-        where: {
-          clienteId: cliente.id,
-        },
-        data: {
-          saldoPendiente: {
-            increment: newFacturaInternetPrimerPago.montoPago,
-          },
-        },
-      });
-      // console.log('EL saldo inicial del nuevo cliente es: ', nuevoSaldoCliente);
-
-      const recordatorioPrimerPago = await prisma.recordatorioPago.create({
-        data: {
-          cliente: {
-            connect: {
-              id: cliente.id,
-            },
-          },
-          facturaInternet: {
-            connect: {
-              id: newFacturaInternetPrimerPago.id,
-            },
-          },
-          tipo: 'Sistema Auto',
-          mensaje: 'Recordatorio de primer pago de servicio',
-          fechaEnviado: fechaPrimerPagoInicial.toDate(),
-          resultado: 'PENDIENTE',
-        },
-      });
-
-      if (sectorId) {
-        if (sectorId) {
-          const sector = await prisma.sector.findUnique({
-            where: { id: sectorId },
-          });
-
-          if (!sector) {
-            throw new Error('Sector no encontrado');
-          }
-
-          await prisma.clienteInternet.update({
-            where: { id: cliente.id },
-            data: {
-              sector: { connect: { id: sectorId } },
-            },
-          });
-        }
-      }
-      console.log('el cliente creado es: ', cliente);
-
-      return {
-        cliente,
-        ubicacion,
-        ip: ipRecord,
-        newFacturaInternetPrimerPago,
-      };
+      },
     });
 
-    if (createClienteInternetDto.idContrato) {
-      const clienteConcontratro = await this.idContradoService.create({
-        archivoContrato: archivoContrato,
-        clienteId: result.cliente.id,
-        fechaFirma: fechaFirma,
-        idContrato: idContrato,
-        observaciones: observacionesContrato,
+    if (connection)
+      this.logger.log(
+        `Cliente ${clienteId} conectado correctamente a mk ${mkSelected}`,
+      );
+    return;
+  }
+
+  private async createClienteTransactional(dto: CreateClienteInternetDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const ubicacion = await this.createUbicacionIfNeeded(dto, tx);
+      const cliente = await this.createClienteEntity(dto, ubicacion?.id, tx);
+
+      await this.createIp(cliente.id, dto, tx);
+      await this.createSaldo(cliente.id, 1, tx);
+      await this.createPrimerFactura(cliente.id, dto, tx);
+
+      if (dto.sectorId) {
+        await this.assignSector(cliente.id, dto.sectorId, tx);
+      }
+
+      if (dto.mkSelected) {
+        await this.assignMk(cliente.id, dto.mkSelected, tx);
+      }
+
+      return { cliente };
+    });
+  }
+
+  private async createUbicacionIfNeeded(
+    dto: CreateClienteInternetDto,
+    tx: Prisma.TransactionClient,
+  ) {
+    if (!dto.coordenadas?.length) return null;
+
+    const lat = Number(dto.coordenadas[0]);
+    const lng = Number(dto.coordenadas[1]);
+
+    if (!lat || !lng) return null;
+
+    return tx.ubicacion.create({
+      data: {
+        latitud: lat,
+        longitud: lng,
+        empresa: {
+          connect: { id: dto.empresaId },
+        },
+      },
+    });
+  }
+
+  private async createSaldo(
+    clienteId: number,
+    empresaId: number,
+    tx: Prisma.TransactionClient,
+  ) {
+    return tx.saldoCliente.create({
+      data: {
+        cliente: {
+          connect: { id: clienteId },
+        },
+        totalPagos: 0,
+        saldoFavor: 0,
+        saldoPendiente: 0,
+      },
+    });
+  }
+
+  private async createClienteEntity(
+    dto: CreateClienteInternetDto,
+    ubicacionId: number | undefined,
+    tx: Prisma.TransactionClient,
+  ) {
+    const fullName = `${dto.nombre ?? ''} ${dto.apellidos ?? ''}`.trim();
+    const nombreSearch = normalizarTexto(fullName);
+
+    return tx.clienteInternet.create({
+      data: {
+        nombre: dto.nombre,
+        apellidos: dto.apellidos || null,
+        telefono: dto.telefono || null,
+        direccion: dto.direccion || null,
+        dpi: dto.dpi || null,
+        observaciones: dto.observaciones || null,
+        contactoReferenciaNombre: dto.contactoReferenciaNombre || null,
+        contactoReferenciaTelefono: dto.contactoReferenciaTelefono || null,
+        ssidRouter: dto.ssidRouter || null,
+        fechaInstalacion: dto.fechaInstalacion || null,
+        estadoCliente: dto.estado || 'ACTIVO',
+        searchNombre: nombreSearch,
+
+        estadoServicioMikrotik: dto.mkSelected
+          ? EstadoServicioMikrotik.PENDIENTE_APLICAR // tiene mk asignado, pendiente de activar
+          : EstadoServicioMikrotik.SIN_MIKROTIK, // sin mk, default
+
+        empresa: { connect: { id: dto.empresaId } },
+
+        municipio: dto.municipioId
+          ? { connect: { id: dto.municipioId } }
+          : undefined,
+
+        departamento: dto.departamentoId
+          ? { connect: { id: dto.departamentoId } }
+          : undefined,
+
+        servicioInternet: dto.servicioWifiId
+          ? { connect: { id: dto.servicioWifiId } }
+          : undefined,
+
+        asesor: dto.asesorId ? { connect: { id: dto.asesorId } } : undefined,
+
+        facturacionZona: {
+          connect: { id: dto.zonaFacturacionId },
+        },
+
+        ubicacion: ubicacionId ? { connect: { id: ubicacionId } } : undefined,
+
+        clienteServicios: {
+          create: dto.servicesIds.map((id) => ({
+            servicio: { connect: { id } },
+            fechaInicio: dto.fechaInstalacion,
+            estado: 'ACTIVO',
+          })),
+        },
+      },
+    });
+  }
+
+  private async createPrimerFactura(
+    clienteId: number,
+    dto: CreateClienteInternetDto,
+    tx: Prisma.TransactionClient,
+  ) {
+    const zona = await tx.facturacionZona.findUnique({
+      where: { id: dto.zonaFacturacionId },
+    });
+
+    const servicio = await tx.servicioInternet.findUnique({
+      where: { id: dto.servicioWifiId },
+    });
+
+    if (!zona || !servicio) {
+      throw new Error('Zona o Servicio no encontrado');
+    }
+
+    const fechaBase = dayjs().date(zona.diaPago);
+    const periodo = periodoFrom(fechaBase.toDate());
+
+    const factura = await tx.facturaInternet.create({
+      data: {
+        periodo,
+        fechaPagoEsperada: fechaBase.toDate(),
+        montoPago: servicio.precio,
+        saldoPendiente: servicio.precio,
+        estadoFacturaInternet: 'PENDIENTE',
+
+        empresa: { connect: { id: dto.empresaId } },
+        cliente: { connect: { id: clienteId } },
+        facturacionZona: { connect: { id: zona.id } },
+
+        nombreClienteFactura: `${dto.nombre} ${dto.apellidos ?? ''}`,
+        detalleFactura: `Pago mensual servicio ${servicio.nombre} (${servicio.velocidad})`,
+      },
+    });
+
+    await tx.saldoCliente.update({
+      where: { clienteId },
+      data: {
+        saldoPendiente: { increment: servicio.precio },
+      },
+    });
+
+    return factura;
+  }
+
+  private async assignSector(
+    clienteId: number,
+    sectorId: number,
+    tx: Prisma.TransactionClient,
+  ) {
+    const sector = await tx.sector.findUnique({
+      where: { id: sectorId },
+    });
+
+    if (!sector) throw new Error('Sector no encontrado');
+
+    await tx.clienteInternet.update({
+      where: { id: clienteId },
+      data: {
+        sector: { connect: { id: sectorId } },
+      },
+    });
+  }
+
+  private async handlePostCreationProcesses(
+    dto: CreateClienteInternetDto,
+    clienteId: number,
+  ) {
+    // Crear contrato si aplica
+    if (dto.idContrato) {
+      await this.idContradoService.create({
+        archivoContrato: dto.archivoContrato,
+        clienteId,
+        fechaFirma: dto.fechaFirma,
+        idContrato: dto.idContrato,
+        observaciones: dto.observacionesContrato,
       });
     }
 
-    return result;
+    // Activación MikroTik opcional
+    if (dto.activateOnMk) {
+      await this.tryActivateOnMk(clienteId, dto);
+    }
   }
+
+  private async tryActivateOnMk(
+    clienteId: number,
+    dto: CreateClienteInternetDto,
+  ) {
+    try {
+      const activateDto: ActivateCustomerDto = {
+        clienteId,
+        userId: dto.userId,
+        password: '',
+        isPasswordRequired: false,
+      };
+
+      await this.ssh.activateCustomer(activateDto);
+
+      this.logger.log(`Cliente ${clienteId} activado en MK correctamente`);
+    } catch (error) {
+      this.logger.error(
+        `No se pudo activar MK para cliente ${clienteId}. Continuando sin bloquear.`,
+      );
+    }
+  }
+
+  private async assignMk(
+    clienteId: number,
+    mkId: number,
+    tx: Prisma.TransactionClient,
+  ) {
+    await tx.clienteInternet.update({
+      where: { id: clienteId },
+      data: {
+        MikrotikRouter: {
+          connect: { id: mkId },
+        },
+      },
+    });
+
+    this.logger.log(`Cliente ${clienteId} asignado a MK ${mkId}`);
+  }
+
+  private async createIp(
+    clienteId: number,
+    dto: CreateClienteInternetDto,
+    tx: Prisma.TransactionClient,
+  ) {
+    return tx.iP.create({
+      data: {
+        direccionIp: dto.ip,
+        gateway: dto.gateway,
+        mascara: dto.mascara,
+        cliente: { connect: { id: clienteId } },
+      },
+    });
+  }
+
+  // ------------------->
 
   async linkSector(clienteId: number, sectorId: number) {
     try {
@@ -449,6 +502,11 @@ export class ClienteInternetService {
           where: { id: clienteInternetId },
           include: {
             medias: {
+              where: {
+                categoria: {
+                  notIn: ['SOPORTE_TICKET'],
+                },
+              },
               select: {
                 id: true,
                 cdnUrl: true,
@@ -492,6 +550,38 @@ export class ClienteInternetService {
                 fechaApertura: true,
                 fechaCierre: true,
                 creadoPor: true,
+                etiquetas: {
+                  select: {
+                    id: true,
+                    etiqueta: true,
+                  },
+                },
+                fechaInicioAtencion: true,
+                fechaResolucionTecnico: true,
+                fechaAsignacion: true,
+                resumen: true,
+                SeguimientoTicket: {
+                  select: {
+                    id: true,
+                    descripcion: true,
+                    creadoEn: true,
+                    usuario: {
+                      select: {
+                        id: true,
+                        rol: true,
+                        nombre: true,
+                        perfil: {
+                          select: {
+                            avatarUrl: true,
+                            bio: true,
+                            portadaUrl: true,
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+
                 tecnico: {
                   select: {
                     id: true,
@@ -558,7 +648,6 @@ export class ClienteInternetService {
                 },
               },
             },
-            // Relación 1:1 con ServicioInternet
             servicioInternet: {
               select: {
                 id: true,
@@ -586,6 +675,18 @@ export class ClienteInternetService {
                 nombre: true,
               },
             },
+            facturacionZona: {
+              select: {
+                id: true,
+                creadoEn: true,
+                actualizadoEn: true,
+                nombre: true,
+                diaGeneracionFactura: true,
+                diaPago: true,
+                diaCorte: true,
+                enviarRecordatorio: true,
+              },
+            },
           },
         });
 
@@ -603,11 +704,14 @@ export class ClienteInternetService {
         );
 
       const totalPendiente = totalfacturasPendientes.reduce((acc, f) => {
-        const pagosRealizados = f.pagos.reduce(
-          (acc, p) => acc + p.montoPagado,
+        const montoFactura = Number(f.montoPago ?? 0);
+
+        const pagosRealizados = (f.pagos ?? []).reduce(
+          (acc, p) => acc + Number(p.montoPagado ?? 0),
           0,
         );
-        return acc + (f.montoPago - pagosRealizados);
+
+        return acc + Math.max(montoFactura - pagosRealizados, 0);
       }, 0);
 
       const totalPagadas = clienteInternetWithRelations.facturaInternet.reduce(
@@ -632,6 +736,8 @@ export class ClienteInternetService {
         contactoReferenciaTelefono:
           clienteInternetWithRelations.contactoReferenciaTelefono,
         estadoCliente: clienteInternetWithRelations.estadoCliente,
+        estadoCobranza: clienteInternetWithRelations.estadoCobranza,
+
         //El estado
         estadoServicioMikrotik:
           clienteInternetWithRelations.estadoServicioMikrotik,
@@ -719,6 +825,24 @@ export class ClienteInternetService {
               nombre: clienteInternetWithRelations.MikrotikRouter.nombre,
             }
           : null,
+        facturacionZona: clienteInternetWithRelations.facturacionZona
+          ? {
+              id: clienteInternetWithRelations.facturacionZona.id,
+              nombre: clienteInternetWithRelations.facturacionZona.nombre,
+              creadoEn: clienteInternetWithRelations.facturacionZona.creadoEn,
+              actualizadoEn:
+                clienteInternetWithRelations.facturacionZona.actualizadoEn,
+
+              enviarRecordatorio:
+                clienteInternetWithRelations.facturacionZona.enviarRecordatorio,
+              diaPago: clienteInternetWithRelations.facturacionZona.diaPago,
+
+              diaGeneracionFactura:
+                clienteInternetWithRelations.facturacionZona
+                  .diaGeneracionFactura,
+              diaCorte: clienteInternetWithRelations.facturacionZona.diaCorte,
+            }
+          : null,
 
         contratoServicioInternet:
           clienteInternetWithRelations.ContratoServicioInternet
@@ -763,16 +887,66 @@ export class ClienteInternetService {
             prioridad: ticket.prioridad,
             fechaApertura: ticket.fechaApertura,
             fechaCierre: ticket.fechaCierre,
+
+            fechaInicioAtencion: ticket.fechaInicioAtencion,
+
+            fechaResolucionTecnico: ticket.fechaResolucionTecnico,
+            resumen: ticket.resumen
+              ? {
+                  id: ticket.resumen.id,
+                  tiempoTecnicoMinutos: ticket.resumen.tiempoTecnicoMinutos,
+                  tiempoTotalMinutos: ticket.resumen.tiempoTotalMinutos,
+                  resueltoComo: ticket.resumen.resueltoComo,
+                  reabierto: ticket.resumen.reabierto,
+                  numeroReaperturas: ticket.resumen.numeroReaperturas,
+                  notasInternas: ticket.resumen.notasInternas,
+                  creadoEn: ticket.resumen.creadoEn,
+                }
+              : null,
+            etiquetas: ticket.etiquetas.map((t) => ({
+              id: t.id,
+              nombre: t.etiqueta.nombre,
+            })),
+
+            seguimientos: (ticket.SeguimientoTicket ?? []).map((s) => ({
+              id: s.id,
+              descripcion: s.descripcion,
+              creadoEn: s.creadoEn,
+              usuario: s.usuario
+                ? {
+                    id: s.usuario.id,
+                    nombre: s.usuario.nombre,
+                    rol: s.usuario.rol,
+                    perfil: {
+                      avatar: s.usuario.perfil?.avatarUrl ?? null,
+                      portadaUrl: s.usuario.perfil?.portadaUrl ?? null,
+                      bio: s.usuario.perfil?.bio ?? null,
+                    },
+                  }
+                : {
+                    id: -1,
+                    nombre: 'Usuario eliminado',
+                    rol: null,
+                    perfil: {
+                      avatar: null,
+                      portadaUrl: null,
+                      bio: null,
+                    },
+                  },
+            })),
+
             creadoPro: ticket.creadoPor
               ? { id: ticket.creadoPor.id, nombre: ticket.creadoPor.nombre }
               : null,
             tecnico: ticket.tecnico
               ? { id: ticket.tecnico.id, nombre: ticket.tecnico.nombre }
               : null,
-            acompanantes: (ticket.asignaciones ?? []).map((aco) => ({
-              id: aco.tecnico.id,
-              nombre: aco.tecnico.nombre,
-            })),
+            acompanantes: (ticket.asignaciones ?? [])
+              .filter((aco) => aco.tecnico)
+              .map((aco) => ({
+                id: aco.tecnico.id,
+                nombre: aco.tecnico.nombre,
+              })),
           }),
         ),
         // FECHA DE VENCIMINEOTO AQUI
@@ -807,18 +981,18 @@ export class ClienteInternetService {
             })),
           }),
         ),
-        clienteServicio: clienteInternetWithRelations.clienteServicios.map(
-          (cs) => ({
+        clienteServicio: (clienteInternetWithRelations.clienteServicios ?? [])
+          .filter((cs) => cs.servicio)
+          .map((cs) => ({
             id: cs.id,
             servicio: {
               id: cs.servicio.id,
               nombre: cs.servicio.nombre,
-              tipo: cs.servicio.descripcion, // Asumí que 'descripcion' es el tipo
+              tipo: cs.servicio.descripcion,
               precio: cs.servicio.precio,
             },
             fechaContratacion: cs.fechaInicio,
-          }),
-        ),
+          })),
       };
 
       return clienteEjemplo;
@@ -848,177 +1022,369 @@ export class ClienteInternetService {
     }
   }
 
+  async getCustomersWhatsappCampaing(dto: CustomersCampaingQuery) {
+    try {
+      const {
+        departamento,
+        estado,
+        estadoCobranza,
+        municipio,
+        nombre,
+        numeroFact,
+        sector,
+        zonaF,
+      } = dto;
+
+      const where: Prisma.ClienteInternetWhereInput = {
+        isEliminado: false,
+      };
+
+      if (departamento) {
+        where.departamentoId = departamento;
+      }
+
+      if (sector) {
+        where.sectorId = sector;
+      }
+
+      if (estado) {
+        where.estadoCliente = estado;
+      }
+
+      if (estadoCobranza) {
+        where.estadoCobranza = estadoCobranza;
+      }
+
+      if (municipio) {
+        where.municipioId = municipio;
+      }
+
+      if (zonaF) {
+        where.facturacionZonaId = zonaF;
+      }
+
+      if (nombre?.trim()) {
+        where.searchNombre = {
+          contains: nombre.trim(),
+          mode: 'insensitive',
+        };
+      }
+
+      if (numeroFact !== undefined && numeroFact !== null) {
+        const clientesConFacturasPendientes =
+          await this.prisma.facturaInternet.groupBy({
+            by: ['clienteId'],
+            where: {
+              estadoFacturaInternet: 'PENDIENTE',
+            },
+            _count: {
+              id: true,
+            },
+            having: {
+              id: {
+                _count: {
+                  equals: numeroFact,
+                },
+              },
+            },
+          });
+
+        const clienteIds = clientesConFacturasPendientes.map(
+          (item) => item.clienteId,
+        );
+
+        where.id = {
+          in: clienteIds,
+        };
+      }
+
+      this.logger.log(
+        `El where construido:\n${JSON.stringify(where, null, 2)}`,
+      );
+
+      const records = await this.prisma.clienteInternet.findMany({
+        where,
+        select: selectCustomerCampaignWhatsapp,
+      });
+
+      return mapCustomersCampaingWhatsapp(records);
+    } catch (error) {
+      throw error;
+    }
+  }
+
   async getCustomersToRuta(q: GetClientesRutaQueryDto) {
     try {
       const {
         empresaId,
-        sortBy,
-        page,
-        perPage,
-        sortDir,
+        sortBy = 'nombre',
+        page = 1,
+        perPage = 10,
+        sortDir = 'asc',
         estado,
         search,
         zonaIds,
         sectorIds,
+        estadoCobranza,
       } = q;
 
-      // Normaliza arrays y limpia 0/NaN
-      const zonas = (zonaIds ?? []).filter((n) => Number.isFinite(n) && n > 0);
-      const sectores = (sectorIds ?? []).filter(
-        (n) => Number.isFinite(n) && n > 0,
+      /*
+       * Los arrays ya deberían venir transformados por el DTO,
+       * pero aquí eliminamos valores inválidos y duplicados.
+       */
+      const zonas = Array.from(
+        new Set((zonaIds ?? []).filter((id) => Number.isInteger(id) && id > 0)),
       );
-      const tokens = strip(search ?? '')
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean);
 
-      // —— WHERE (AND estricto para Prisma, se usa después solo en relaciones/orden) ——
+      const sectores = Array.from(
+        new Set(
+          (sectorIds ?? []).filter((id) => Number.isInteger(id) && id > 0),
+        ),
+      );
+
+      /*
+       * Debe utilizar exactamente la misma normalización que se usa
+       * cuando se genera ClienteInternet.searchNombre.
+       *
+       * No tokenizamos. Se busca el texto completo con contains.
+       */
+      const normalizedSearch = strip(search ?? '')
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, ' ');
+
+      /*
+       * Una sola fuente de verdad para todos los filtros.
+       *
+       * Este where se usa tanto para count como para findMany,
+       * evitando que la paginación se calcule con filtros distintos.
+       */
       const where: Prisma.ClienteInternetWhereInput = {
-        ...(empresaId ? { empresaId } : {}),
-        ...(estado ? { estadoCliente: estado } : {}),
-        ...(zonas.length ? { facturacionZonaId: { in: zonas } } : {}),
-        ...(sectores.length ? { sectorId: { in: sectores } } : {}),
-        //  nada para que no filtre doble.
+        isEliminado: false,
+
+        ...(empresaId
+          ? {
+              empresaId,
+            }
+          : {}),
+
+        ...(estado
+          ? {
+              estadoCliente: estado,
+            }
+          : {}),
+
+        ...(estadoCobranza
+          ? {
+              estadoCobranza,
+            }
+          : {}),
+
+        ...(zonas.length > 0
+          ? {
+              facturacionZonaId: {
+                in: zonas,
+              },
+            }
+          : {}),
+
+        ...(sectores.length > 0
+          ? {
+              sectorId: {
+                in: sectores,
+              },
+            }
+          : {}),
+
+        ...(normalizedSearch
+          ? {
+              searchNombre: {
+                contains: normalizedSearch,
+              },
+            }
+          : {}),
       };
 
-      // —— ORDER / PAGINACIÓN (Prisma) ——
-      const orderBy:
-        | Prisma.ClienteInternetOrderByWithRelationInput
-        | Prisma.ClienteInternetOrderByWithRelationInput[] =
+      /*
+       * Ordenamiento remoto real.
+       *
+       * Prisma aplica orderBy antes de skip/take, por lo que las páginas
+       * representan correctamente el orden global.
+       *
+       * id se utiliza como desempate para evitar cambios de posición
+       * cuando varios clientes tienen el mismo nombre o saldo.
+       */
+      const orderBy: Prisma.ClienteInternetOrderByWithRelationInput[] =
         sortBy === 'saldo'
-          ? { saldoCliente: { saldoPendiente: sortDir } }
-          : [{ nombre: sortDir }, { apellidos: sortDir }];
+          ? [
+              {
+                saldoCliente: {
+                  saldoPendiente: sortDir,
+                },
+              },
+              {
+                id: 'asc',
+              },
+            ]
+          : [
+              {
+                nombre: sortDir,
+              },
+              {
+                apellidos: sortDir,
+              },
+              {
+                id: 'asc',
+              },
+            ];
 
       const skip = (page - 1) * perPage;
-      const take = perPage;
 
-      // ------------------------------------------------------------
-      // 1) ID MATCH con búsqueda acento-insensible (sin JOINs, sin "sc")
-      // ------------------------------------------------------------
+      /*
+       * Count y página usan exactamente los mismos filtros.
+       */
+      const [count, rows] = await this.prisma.$transaction([
+        this.prisma.clienteInternet.count({
+          where,
+        }),
 
-      const andEmpresa = empresaId
-        ? Prisma.sql` AND c."empresaId" = ${empresaId}`
-        : Prisma.sql``;
+        this.prisma.clienteInternet.findMany({
+          where,
+          orderBy,
+          skip,
+          take: perPage,
 
-      const andEstado = estado
-        ? Prisma.sql` AND c."estadoCliente" = CAST(${estado} AS "EstadoCliente")` // ← o ::text = ${estado}
-        : Prisma.sql``;
+          select: {
+            id: true,
+            nombre: true,
+            apellidos: true,
+            telefono: true,
+            direccion: true,
+            estadoCliente: true,
+            estadoCobranza: true,
 
-      const andZonas = zonas.length
-        ? Prisma.sql` AND c."facturacionZonaId" IN (${Prisma.join(
-            zonas.map((n) => Prisma.sql`${n}`),
-            ', ',
-          )})`
-        : Prisma.sql``;
-
-      const andSectores = sectores.length
-        ? Prisma.sql` AND c."sectorId" IN (${Prisma.join(
-            sectores.map((n) => Prisma.sql`${n}`),
-            ', ',
-          )})`
-        : Prisma.sql``;
-
-      // Usa unaccent(); si tu Postgres no la tiene, dímelo y te paso el fallback con translate(...)
-      const andSearch = tokens.length
-        ? Prisma.sql` AND ${Prisma.join(
-            tokens.map(
-              (t) => Prisma.sql`
-            translate(
-              coalesce(c."nombre",'') || ' ' ||
-              coalesce(c."apellidos",'') || ' ' ||
-              coalesce(c."direccion",'') || ' ' ||
-              coalesce(c."telefono"::text,''),
-              ${ACCENT_FROM},
-              ${ACCENT_TO}
-            ) ILIKE translate(${`%${t}%`}, ${ACCENT_FROM}, ${ACCENT_TO})
-          `,
-            ),
-            ' AND ', // (en Prisma v6 el separador debe ser string)
-          )}`
-        : Prisma.sql``;
-
-      // a) Total
-      const [{ count }] = await this.prisma.$queryRaw<
-        { count: number }[]
-      >(Prisma.sql`
-      SELECT COUNT(*)::int AS count
-      FROM "ClienteInternet" c
-      WHERE 1=1
-      ${andEmpresa} ${andEstado} ${andZonas} ${andSectores} ${andSearch}
-    `);
-
-      // b) IDs de la página (sin ordenar por "sc", solo por id para estabilidad)
-      const idRows = await this.prisma.$queryRaw<{ id: number }[]>(Prisma.sql`
-      SELECT c.id
-      FROM "ClienteInternet" c
-      WHERE 1=1
-      ${andEmpresa} ${andEstado} ${andZonas} ${andSectores} ${andSearch}
-      ORDER BY c.id
-      LIMIT ${take} OFFSET ${skip}
-    `);
-
-      const idsPage = idRows.map((r) => r.id);
-      if (idsPage.length === 0) {
-        return { items: [], total: count, page, perPage };
-      }
-
-      // ------------------------------------------------------------
-      // 2) Trae la página final con Prisma (orden/relaciones)
-      // ------------------------------------------------------------
-      const rows = await this.prisma.clienteInternet.findMany({
-        where: { ...where, id: { in: idsPage } },
-        orderBy,
-        // Nota: el orden final lo controla Prisma (nombre/apellidos o saldo);
-        // si quieres preservar exactamente el orden de idsPage, avísame y lo reordenamos en memoria.
-        select: {
-          id: true,
-          nombre: true,
-          apellidos: true,
-          telefono: true,
-          direccion: true,
-          estadoCliente: true,
-          saldoCliente: { select: { saldoPendiente: true } },
-          municipio: { select: { id: true, nombre: true } },
-          sector: { select: { id: true, nombre: true } },
-          facturacionZona: { select: { id: true, nombre: true } },
-          facturaInternet: {
-            where: {
-              estadoFacturaInternet: {
-                in: ['PARCIAL', 'PENDIENTE', 'VENCIDA'],
+            saldoCliente: {
+              select: {
+                saldoPendiente: true,
               },
             },
-            select: { id: true, fechaPagoEsperada: true, montoPago: true },
-          },
-        },
-      });
 
-      const items = rows.map((c) => ({
-        id: c.id,
-        nombre: c.nombre,
-        apellidos: c.apellidos ?? '',
-        telefono: c.telefono ?? null,
-        direccion: c.direccion ?? null,
-        estadoCliente: c.estadoCliente,
-        saldoPendiente: c.saldoCliente?.saldoPendiente ?? 0,
-        facturacionZona: c.facturacionZona?.id ?? null,
-        zonaFacturacion: c.facturacionZona?.nombre ?? '',
-        facturasPendientes: c.facturaInternet.length,
-        sector: { id: c.sector?.id ?? null, nombre: c.sector?.nombre ?? '' },
-        municipio: {
-          id: c.municipio?.id ?? null,
-          nombre: c.municipio?.nombre ?? '',
+            municipio: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+
+            sector: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+
+            facturacionZona: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+
+            facturaInternet: {
+              where: {
+                estadoFacturaInternet: {
+                  in: ['PARCIAL', 'PENDIENTE', 'VENCIDA'],
+                },
+              },
+
+              select: {
+                id: true,
+                fechaPagoEsperada: true,
+                montoPago: true,
+              },
+            },
+          },
+        }),
+      ]);
+
+      const items = rows.map((cliente) => ({
+        id: cliente.id,
+        nombre: cliente.nombre,
+        apellidos: cliente.apellidos ?? '',
+        telefono: cliente.telefono ?? null,
+        direccion: cliente.direccion ?? null,
+
+        estadoCliente: cliente.estadoCliente,
+        estadoCobranza: cliente.estadoCobranza,
+
+        saldoPendiente: Number(cliente.saldoCliente?.saldoPendiente ?? 0),
+
+        facturacionZona: cliente.facturacionZona?.id ?? null,
+
+        zonaFacturacion: cliente.facturacionZona?.nombre ?? '',
+
+        facturasPendientes: cliente.facturaInternet.length,
+
+        sector: {
+          id: cliente.sector?.id ?? null,
+          nombre: cliente.sector?.nombre ?? '',
         },
-        facturas: c.facturaInternet.map((f) => ({
-          id: f.id,
-          montoFactura: f.montoPago,
-          fechaPagoEsperada: f.fechaPagoEsperada,
+
+        municipio: {
+          id: cliente.municipio?.id ?? null,
+          nombre: cliente.municipio?.nombre ?? '',
+        },
+
+        facturas: cliente.facturaInternet.map((factura) => ({
+          id: factura.id,
+
+          montoFactura: Number(factura.montoPago ?? 0),
+
+          fechaPagoEsperada: factura.fechaPagoEsperada,
         })),
       }));
 
-      return { items, total: count, page, perPage };
+      this.logger.log(
+        `Clientes para ruta: ${JSON.stringify(
+          {
+            filtros: {
+              empresaId,
+              estado,
+              estadoCobranza,
+              search: normalizedSearch || undefined,
+              zonaIds: zonas,
+              sectorIds: sectores,
+              sortBy,
+              sortDir,
+              page,
+              perPage,
+            },
+            resultado: {
+              total: count,
+              itemsPagina: items.length,
+            },
+          },
+          null,
+          2,
+        )}`,
+      );
+
+      return {
+        items,
+        total: count,
+        page,
+        perPage,
+      };
     } catch (error) {
-      this.logger.error('El error generado es: ', error);
-      if (error instanceof HttpException) throw error;
+      this.logger.error(
+        'Error generado al obtener clientes para ruta',
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
       throw new InternalServerErrorException(
         'Fatal error: Error inesperado en clientes ruta',
       );
@@ -1035,17 +1401,22 @@ export class ClienteInternetService {
       .trim(); // recorta
   }
 
-  async findCustomersToTable(
-    page: number = 1,
-    limit: number = 10,
-    paramSearch?: string,
-    zona?: number,
-    municipio?: number,
-    departamento?: number,
-    sector?: number,
-    estado?: string,
-  ) {
-    const skip = (page - 1) * limit;
+  async findCustomersToTable(dto: GetCustomersQueryDto) {
+    const {
+      depaSelected,
+      estadoSelected,
+      limite,
+      muniSelected,
+      page,
+      paramSearch,
+      sectorSelected,
+      zonasFacturacionSelected,
+      estadoCobranzaSelected,
+    } = dto;
+
+    this.logger.log(`DTO en tabla:\n${JSON.stringify(dto, null, 2)}`);
+
+    const skip = (page - 1) * limite;
 
     // Preparar términos de búsqueda
     let terms: string[] = [];
@@ -1086,13 +1457,18 @@ export class ClienteInternetService {
     }
 
     // Filtros exactos
-    if (zona) andConditions.push({ facturacionZonaId: zona });
-    if (municipio) andConditions.push({ municipioId: municipio });
-    if (departamento) andConditions.push({ departamentoId: departamento });
-    if (sector) andConditions.push({ sectorId: sector });
-    if (estado) {
-      andConditions.push({ estadoCliente: estado as EstadoCliente });
+    if (zonasFacturacionSelected)
+      andConditions.push({ facturacionZonaId: zonasFacturacionSelected });
+    if (muniSelected) andConditions.push({ municipioId: muniSelected });
+    if (depaSelected) andConditions.push({ departamentoId: depaSelected });
+    if (sectorSelected) andConditions.push({ sectorId: sectorSelected });
+    if (estadoSelected) {
+      andConditions.push({ estadoCliente: estadoSelected as EstadoCliente });
     }
+    if (estadoCobranzaSelected)
+      andConditions.push({
+        estadoCobranza: estadoCobranzaSelected as EstadoCobranzaCliente,
+      });
 
     const whereCondition: Prisma.ClienteInternetWhereInput =
       andConditions.length > 0 ? { AND: andConditions } : {};
@@ -1101,7 +1477,7 @@ export class ClienteInternetService {
       await this.prisma.$transaction([
         this.prisma.clienteInternet.findMany({
           skip,
-          take: limit,
+          take: limite,
           orderBy: {
             creadoEn: 'desc',
           },
@@ -1116,6 +1492,7 @@ export class ClienteInternetService {
             creadoEn: true,
             actualizadoEn: true,
             estadoCliente: true,
+            estadoCobranza: true,
             sector: {
               select: {
                 id: true,
@@ -1156,6 +1533,23 @@ export class ClienteInternetService {
                 nombre: true,
               },
             },
+            facturaInternet: {
+              select: {
+                id: true,
+                estadoFacturaInternet: true,
+                creadoEn: true,
+                fechaPagoEsperada: true,
+                fechaPagada: true,
+                pagos: {
+                  where: {},
+                  select: {
+                    id: true,
+                    fechaPago: true,
+                    montoPagado: true,
+                  },
+                },
+              },
+            },
           },
         }),
 
@@ -1188,39 +1582,51 @@ export class ClienteInternetService {
         }),
       ]);
 
-    const formattedCustomers = customers.map((customer) => ({
-      id: customer.id,
-      nombreCompleto: `${customer.nombre} ${customer.apellidos}`,
-      estado: customer.estadoCliente,
-      telefono: customer.telefono,
-      dpi: customer.dpi,
-      direccion: customer.direccion,
-      creadoEn: customer.creadoEn,
-      actualizadoEn: customer.actualizadoEn,
-      departamento: customer.departamento?.nombre || 'No disponible',
-      municipio: customer.municipio?.nombre || 'No disponible',
-      direccionIp: customer.IP?.direccionIp || 'No disponible',
-      municipioId: customer.municipio.id,
-      sector: customer.sector || null,
-      sectorId: customer.sector ? customer.sector.id : null,
-      departamentoId: customer.departamento.id,
-      servicios: customer.servicioInternet
-        ? [
-            {
-              id: customer.servicioInternet.id,
-              nombreServicio: customer.servicioInternet.nombre,
-              velocidad: customer.servicioInternet.velocidad,
-              precio: customer.servicioInternet.precio,
-              estado: customer.servicioInternet.estado,
-              creadoEn: customer.servicioInternet.actualizadoEn,
-              actualizadoEn: customer.servicioInternet.actualizadoEn,
-            },
-          ]
-        : [],
-      facturacionZona: customer.facturacionZona?.nombre || 'Sin zona',
-      facturacionZonaId:
-        customer.facturacionZona?.id || 'Sin zona facturacion id',
-    }));
+    const formattedCustomers = await Promise.all(
+      customers.map(async (customer) => {
+        const historial = await this.verifyCreditService.calculatePenality(
+          customer.facturaInternet,
+        );
+        const result =
+          await this.verifyCreditService.generarResultado(historial);
+
+        return {
+          id: customer.id,
+          nombreCompleto: `${customer.nombre} ${customer.apellidos}`,
+          estado: customer.estadoCliente,
+          estadoCobranza: customer.estadoCobranza,
+          telefono: customer.telefono,
+          dpi: customer.dpi,
+          direccion: customer.direccion,
+          creadoEn: customer.creadoEn,
+          actualizadoEn: customer.actualizadoEn,
+          departamento: customer.departamento?.nombre || 'No disponible',
+          municipio: customer.municipio?.nombre || 'No disponible',
+          direccionIp: customer.IP?.direccionIp || 'No disponible',
+          municipioId: customer.municipio.id,
+          sector: customer.sector || null,
+          sectorId: customer.sector ? customer.sector.id : null,
+          departamentoId: customer.departamento.id,
+          clasificacionCredito: result,
+          servicios: customer.servicioInternet
+            ? [
+                {
+                  id: customer.servicioInternet.id,
+                  nombre: customer.servicioInternet.nombre,
+                  velocidad: customer.servicioInternet.velocidad,
+                  precio: customer.servicioInternet.precio,
+                  estado: customer.servicioInternet.estado,
+                  creadoEn: customer.servicioInternet.actualizadoEn,
+                  actualizadoEn: customer.servicioInternet.actualizadoEn,
+                },
+              ]
+            : [],
+          facturacionZona: customer.facturacionZona?.nombre || 'Sin zona',
+          facturacionZonaId:
+            customer.facturacionZona?.id || 'Sin zona facturacion id',
+        };
+      }),
+    );
 
     return {
       data: formattedCustomers,
@@ -1421,10 +1827,34 @@ export class ClienteInternetService {
     const clienteId = id;
     console.log('entrando a eliminar: ', id);
 
-    return await this.prisma.$transaction(async (tx) => {
+    const cliente = await this.prisma.clienteInternet.findUnique({
+      where: { id: clienteId },
+      select: {
+        mikrotikRouterId: true,
+        IP: {
+          select: {
+            direccionIp: true,
+          },
+        },
+      },
+    });
+
+    let direccionIP = cliente?.IP?.direccionIp;
+    let mikrotikId = cliente?.mikrotikRouterId;
+
+    const userDeleted = await this.prisma.$transaction(async (tx) => {
       // Verificamos si existe el cliente
       const cliente = await tx.clienteInternet.findUnique({
         where: { id: clienteId },
+        select: {
+          IP: {
+            select: {
+              direccionIp: true,
+              mascara: true,
+            },
+          },
+          mikrotikRouterId: true,
+        },
       });
 
       if (!cliente) {
@@ -1470,15 +1900,39 @@ export class ClienteInternetService {
       });
 
       // 8. Finalmente, eliminar el cliente
-      await tx.clienteInternet.delete({
+      let c = await tx.clienteInternet.delete({
         where: { id: clienteId },
+        select: {
+          mikrotikRouterId: true,
+          IP: {
+            select: {
+              id: true,
+              direccionIp: true,
+            },
+          },
+        },
       });
 
       return {
         message: `Cliente con id ${clienteId} y todas sus relaciones han sido eliminados correctamente.`,
+        cliente: c,
       };
     });
+
+    if (mikrotikId && direccionIP) {
+      try {
+        await this.ssh.clearIpFromAllLists(mikrotikId, direccionIP);
+      } catch (error) {
+        this.logger.error(
+          `No se pudo limpiar IP ${direccionIP} del MK ${mikrotikId} | ERROR: ${error}`,
+        );
+      }
+    }
+
+    return userDeleted;
   }
+
+  //COMENTARIO PARA PUSHEAR
 
   async deleteClientsWithRelations() {
     try {
@@ -1542,7 +1996,6 @@ export class ClienteInternetService {
               fechaFirma: true,
               archivoContrato: true,
               observaciones: true,
-              // 🔥 No pedimos media ni mediaId
             },
           },
           MikrotikRouter: {
@@ -1568,6 +2021,8 @@ export class ClienteInternetService {
         contactoReferenciaNombre: customer.contactoReferenciaNombre,
         contactoReferenciaTelefono: customer.contactoReferenciaTelefono,
         estado: customer.estadoCliente,
+        estadoCobranza: customer.estadoCobranza,
+
         coordenadas: customer.ubicacion
           ? [`${customer.ubicacion.latitud}`, `${customer.ubicacion.longitud}`]
           : [],
@@ -1664,422 +2119,250 @@ export class ClienteInternetService {
       });
       return client;
     } catch (error) {
-      this.logger.error('Error generado en módulo cliente: ', error?.stack);
+      this.logger.error('Error generado en módulo cliente: ', error);
       if (error instanceof HttpException) throw error;
       throw new InternalServerErrorException('Fatal Error: Error inesperado');
     }
   }
 
-  async updateClienteInternet(
-    id: number,
-    updateCustomerService: UpdateClienteInternetDto,
+  // ─── HELPER: calcular nuevo estado MK ────────────────────────────────────────
+  private resolveNuevoEstadoMk(
+    clienteBefore: {
+      mikrotikRouterId: number | null;
+      estadoServicioMikrotik: EstadoServicioMikrotik;
+    },
+    nuevoMkId: number | null | undefined,
+  ): EstadoServicioMikrotik | undefined {
+    const anteriorMkId = clienteBefore.mikrotikRouterId;
+    const estadoActual = clienteBefore.estadoServicioMikrotik;
+
+    // No viene campo mikrotikRouterId en el DTO → no tocar
+    if (nuevoMkId === undefined) return undefined;
+
+    // Tenía MK → se le quita
+    if (anteriorMkId !== null && nuevoMkId === null) {
+      return EstadoServicioMikrotik.SIN_MIKROTIK;
+    }
+
+    // No tenía MK → se le asigna uno
+    if (anteriorMkId === null && nuevoMkId !== null) {
+      return EstadoServicioMikrotik.PENDIENTE_APLICAR;
+    }
+
+    // Tenía MK con estado SIN_MIKROTIK (inconsistencia como tu caso 577)
+    // → corregir a PENDIENTE_APLICAR
+    if (
+      anteriorMkId !== null &&
+      estadoActual === EstadoServicioMikrotik.SIN_MIKROTIK
+    ) {
+      return EstadoServicioMikrotik.PENDIENTE_APLICAR;
+    }
+
+    // Cambió de un MK a otro MK distinto → pendiente de re-aplicar
+    if (
+      anteriorMkId !== null &&
+      nuevoMkId !== null &&
+      anteriorMkId !== nuevoMkId
+    ) {
+      return EstadoServicioMikrotik.PENDIENTE_APLICAR;
+    }
+
+    // Mismo MK, estado ya válido → no tocar
+    return undefined;
+  }
+
+  // ─── HELPER: upsert ubicación ─────────────────────────────────────────────────
+  private async upsertUbicacion(
+    clienteId: number,
+    coordenadas: string[] | undefined,
+    empresaId: number,
+    tx: Prisma.TransactionClient,
   ) {
-    const {
-      coordenadas,
-      municipioId,
-      departamentoId,
-      empresaId,
-      servicesIds,
-      asesorId,
-      ip,
-      mascara,
-      gateway,
-      servicioWifiId,
-      zonaFacturacionId,
-      archivoContrato,
-      fechaFirma,
-      idContrato,
-      observacionesContrato,
-      sectorId,
-      mikrotikRouterId,
-      enviarRecordatorio,
-    } = updateCustomerService;
+    if (!coordenadas?.length) return undefined;
 
-    this.logger.log('El dto para actualizar es: ', updateCustomerService);
+    const latitud = Number(coordenadas[0]);
+    const longitud = Number(coordenadas[1]);
 
-    const latitud = coordenadas?.[0] ? Number(coordenadas[0]) : null;
-    const longitud = coordenadas?.[1] ? Number(coordenadas[1]) : null;
+    if (!latitud || !longitud) return undefined;
 
-    const fullName =
-      `${updateCustomerService.nombre ?? ''} ${updateCustomerService.apellidos ?? ''}`.trim();
+    return tx.ubicacion.upsert({
+      where: { clienteId },
+      update: { latitud, longitud },
+      create: {
+        latitud,
+        longitud,
+        empresa: { connect: { id: empresaId } },
+      },
+    });
+  }
+
+  // ─── HELPER: upsert contrato ──────────────────────────────────────────────────
+  private async updateContratoIfNeeded(
+    clienteId: number,
+    dto: UpdateClienteInternetDto,
+    tx: Prisma.TransactionClient,
+  ) {
+    if (!dto.idContrato) return;
+
+    await tx.contratoFisico.update({
+      where: { clienteId },
+      data: {
+        archivoContrato: dto.archivoContrato,
+        fechaFirma: new Date(dto.fechaFirma),
+        idContrato: dto.idContrato,
+        observaciones: dto.observacionesContrato,
+      },
+    });
+  }
+
+  // ─── HELPER: resolver relación MikroTik para Prisma ──────────────────────────
+  private resolveMkRelation(mikrotikRouterId: number | null | undefined) {
+    if (mikrotikRouterId === null) return { disconnect: true };
+    if (mikrotikRouterId) return { connect: { id: mikrotikRouterId } };
+    return undefined;
+  }
+
+  // ─── PRINCIPAL ────────────────────────────────────────────────────────────────
+  async updateClienteInternet(id: number, dto: UpdateClienteInternetDto) {
+    const fullName = `${dto.nombre ?? ''} ${dto.apellidos ?? ''}`.trim();
     const nombreSearch = normalizarTexto(fullName);
+    const serviceIds: number[] = dto.servicesIds ?? [];
 
-    const serviceIds: number[] = servicesIds;
-
-    const result = await this.prisma.$transaction(async (prisma) => {
-      // 1) ANTES DEL UPDATE: estado relevante para Mikrotik
-      const clienteBefore = await prisma.clienteInternet.findUnique({
+    return this.prisma.$transaction(async (tx) => {
+      //OBTENER ESTADO ANTERIOR ──────────────────────────────────────
+      const clienteBefore = await tx.clienteInternet.findUnique({
         where: { id },
         select: {
           id: true,
           estadoCliente: true,
           mikrotikRouterId: true,
           estadoServicioMikrotik: true,
-          IP: {
-            select: {
-              direccionIp: true,
-            },
-          },
+          IP: { select: { direccionIp: true } },
         },
       });
 
-      if (!clienteBefore) {
-        throw new Error('Cliente no encontrado');
-      }
+      if (!clienteBefore) throw new NotFoundException('Cliente no encontrado');
 
-      // 2) Ubicación
-      let ubicacion;
-      if (latitud !== null && longitud !== null) {
-        ubicacion = await prisma.ubicacion.upsert({
-          where: { clienteId: id },
-          update: { latitud, longitud },
-          create: {
-            latitud,
-            longitud,
-            empresa: { connect: { id: 1 } },
-          },
-        });
-      }
+      //  CALCULAR NUEVO ESTADO MK ─────────────────────────────────────
+      const nuevoEstadoServicioMk = this.resolveNuevoEstadoMk(
+        clienteBefore,
+        dto.mikrotikRouterId,
+      );
 
-      const desinstalado: Date | null =
-        updateCustomerService.estado === 'DESINSTALADO'
-          ? dayjs().tz(TZ).toDate()
-          : null;
+      // UPSERT UBICACIÓN ─────────────────────────────────────────────
+      const ubicacion = await this.upsertUbicacion(
+        id,
+        dto.coordenadas,
+        dto.empresaId,
+        tx,
+      );
 
-      // 3) UPDATE del cliente
-      const updatedCliente = await prisma.clienteInternet.update({
+      // FECHA DESINSTALACIÓN ─────────────────────────────────────────
+      const desinstaladoEn: Date | null =
+        dto.estado === 'DESINSTALADO' ? dayjs().tz(TZ).toDate() : null;
+
+      // ACTUALIZAR CLIENTE ───────────────────────────────────────────
+      const updatedCliente = await tx.clienteInternet.update({
         where: { id },
         data: {
           searchNombre: nombreSearch,
-          nombre: updateCustomerService.nombre,
-          enviarRecordatorio,
+          nombre: dto.nombre,
+          apellidos: dto.apellidos || null,
+          telefono: dto.telefono || null,
+          direccion: dto.direccion || null,
+          dpi: dto.dpi || null,
+          observaciones: dto.observaciones || null,
+          contactoReferenciaNombre: dto.contactoReferenciaNombre || null,
+          contactoReferenciaTelefono: dto.contactoReferenciaTelefono || null,
+          contrasenaWifi: dto.contrasenaWifi,
+          ssidRouter: dto.ssidRouter,
+          fechaInstalacion: dto.fechaInstalacion || null,
+          estadoCliente: dto.estado || 'ACTIVO',
+          estadoCobranza: dto.estadoCobranza || 'AL_DIA',
+          enviarRecordatorio: dto.enviarRecordatorio,
+          desinstaladoEn,
 
-          apellidos: updateCustomerService.apellidos || null,
-          telefono: updateCustomerService.telefono || null,
-          direccion: updateCustomerService.direccion || null,
-          dpi: updateCustomerService.dpi || null,
-          observaciones: updateCustomerService.observaciones || null,
+          // Solo se actualiza si resolveNuevoEstadoMk devuelve algo
+          ...(nuevoEstadoServicioMk !== undefined && {
+            estadoServicioMikrotik: nuevoEstadoServicioMk,
+          }),
 
-          contactoReferenciaNombre:
-            updateCustomerService.contactoReferenciaNombre || null,
-          contactoReferenciaTelefono:
-            updateCustomerService.contactoReferenciaTelefono || null,
-          contrasenaWifi: updateCustomerService.contrasenaWifi,
-          ssidRouter: updateCustomerService.ssidRouter,
-          fechaInstalacion: updateCustomerService.fechaInstalacion || null,
-          estadoCliente: updateCustomerService.estado || 'ACTIVO',
-          desinstaladoEn: desinstalado,
-
-          servicioInternet: servicioWifiId
-            ? { connect: { id: servicioWifiId } }
+          servicioInternet: dto.servicioWifiId
+            ? { connect: { id: dto.servicioWifiId } }
             : undefined,
-          municipio: municipioId ? { connect: { id: municipioId } } : undefined,
-          sector: sectorId ? { connect: { id: sectorId } } : undefined,
-          departamento: departamentoId
-            ? { connect: { id: departamentoId } }
+          municipio: dto.municipioId
+            ? { connect: { id: dto.municipioId } }
             : undefined,
-          empresa: { connect: { id: empresaId } },
-          asesor: asesorId ? { connect: { id: asesorId } } : undefined,
+          sector: dto.sectorId ? { connect: { id: dto.sectorId } } : undefined,
+          departamento: dto.departamentoId
+            ? { connect: { id: dto.departamentoId } }
+            : undefined,
+          empresa: { connect: { id: dto.empresaId } },
+          asesor: dto.asesorId ? { connect: { id: dto.asesorId } } : undefined,
           ubicacion: ubicacion ? { connect: { id: ubicacion.id } } : undefined,
-          facturacionZona: zonaFacturacionId
-            ? { connect: { id: zonaFacturacionId } }
+          facturacionZona: dto.zonaFacturacionId
+            ? { connect: { id: dto.zonaFacturacionId } }
             : undefined,
 
-          MikrotikRouter:
-            mikrotikRouterId === null
-              ? { disconnect: true }
-              : mikrotikRouterId
-                ? { connect: { id: mikrotikRouterId } }
-                : undefined,
+          MikrotikRouter: this.resolveMkRelation(dto.mikrotikRouterId),
 
           clienteServicios: {
             deleteMany: {},
             create: serviceIds.map((serviceId) => ({
               servicio: { connect: { id: serviceId } },
-              fechaInicio: updateCustomerService.fechaInstalacion,
+              fechaInicio: dto.fechaInstalacion,
               estado: 'ACTIVO',
             })),
           },
         },
       });
 
-      // 4) IP
-      const ipRecord = await prisma.iP.upsert({
-        where: { clienteId: id },
-        update: { direccionIp: ip, gateway, mascara },
-        create: {
-          direccionIp: ip,
-          gateway,
-          mascara,
-          cliente: { connect: { id } },
-        },
-      });
+      // ACTUALIZAR CONTRATO SI APLICA ────────────────────────────────
+      await this.updateContratoIfNeeded(id, dto, tx);
 
-      // 5) Sincronizar estadoServicioMikrotik en BD
-      await this.syncEstadoServicioMikrotik({
-        tx: prisma,
-        clienteId: id,
-        estadoCliente: updatedCliente.estadoCliente,
-        mikrotikRouterId: updatedCliente.mikrotikRouterId,
-      });
-
-      // 6) DESPUÉS del update: estado actual para Mikrotik
-      const clienteAfter = await prisma.clienteInternet.findUnique({
+      // RETORNAR ─────────────────────────────────────────────────────
+      const clienteAfter = await tx.clienteInternet.findUnique({
         where: { id },
         select: {
           id: true,
           estadoCliente: true,
           mikrotikRouterId: true,
           estadoServicioMikrotik: true,
-          IP: {
-            select: {
-              direccionIp: true,
-            },
-          },
+          IP: { select: { direccionIp: true } },
         },
       });
 
-      if (idContrato) {
-        await prisma.contratoFisico.update({
-          where: { clienteId: id },
-          data: {
-            archivoContrato,
-            fechaFirma: new Date(fechaFirma),
-            idContrato,
-            observaciones: observacionesContrato,
-          },
-        });
-      }
-
-      return {
-        clienteBefore,
-        clienteAfter,
-        updatedCliente,
-        ubicacion,
-        ip: ipRecord,
-      };
-    });
-
-    const {
-      clienteBefore,
-      clienteAfter,
-      updatedCliente,
-      ubicacion,
-      ip: ipRecord,
-    } = result;
-
-    // 7) Manejar cambios de Mikrotik a nivel de red (Mikrotik)
-    await this.handleMikrotikChangeOnUpdate(clienteBefore, clienteAfter);
-
-    return {
-      cliente: updatedCliente,
-      ubicacion,
-      ip: ipRecord,
-    };
-  }
-
-  // HELPERS
-  /**
-   * Maneja el mikrotik
-   * @param before Cliente antes de la actualizacion
-   * @param after Mikrotik despues de la actualizacion, id.
-   * @returns
-   */
-  private async handleMikrotikChangeOnUpdate(
-    before: {
-      id: number;
-      estadoCliente: EstadoCliente;
-      mikrotikRouterId: number | null;
-      estadoServicioMikrotik: EstadoServicioMikrotik;
-      IP: { direccionIp: string | null } | null;
-    },
-    after: {
-      id: number;
-      estadoCliente: EstadoCliente;
-      mikrotikRouterId: number | null;
-      estadoServicioMikrotik: EstadoServicioMikrotik;
-      IP: { direccionIp: string | null } | null;
-    },
-  ) {
-    const mkAntes = before.mikrotikRouterId;
-    const mkDespues = after.mikrotikRouterId;
-    const ipAntes = before.IP?.direccionIp ?? null;
-    const ipDespues = after.IP?.direccionIp ?? null;
-
-    // Estado final que manda: después de syncEstadoServicioMikrotik
-    const shouldBeSuspended =
-      after.estadoServicioMikrotik === EstadoServicioMikrotik.SUSPENDIDO;
-    const shouldHaveMikrotik =
-      after.mikrotikRouterId !== null &&
-      after.estadoServicioMikrotik !== EstadoServicioMikrotik.SIN_MIKROTIK;
-
-    // 1) Si no hay cambios de Mikrotik, no hacemos nada
-    if (mkAntes === mkDespues) {
-      this.logger.debug(
-        `Cliente ${after.id} sin cambios de Mikrotik (id=${mkAntes}). No se toca Mikrotik.`,
-      );
-      return;
-    }
-
-    // 2) Caso: antes TENÍA Mikrotik y ahora NO tiene => limpiar en router anterior si aplica
-    if (mkAntes && !mkDespues && ipAntes) {
       this.logger.log(
-        `Cliente ${after.id} ha perdido Mikrotik (router ${mkAntes} -> null). Limpieza de lista de suspendidos si aplica...`,
+        `[updateClienteInternet] Cliente ${id} actualizado. ` +
+          `MK: ${clienteBefore.mikrotikRouterId} → ${clienteAfter.mikrotikRouterId}. ` +
+          `EstadoMK: ${clienteBefore.estadoServicioMikrotik} → ${clienteAfter.estadoServicioMikrotik}`,
       );
 
-      // Si estaba suspendido antes o después, intentamos limpiar la lista en el router anterior
-      if (
-        before.estadoServicioMikrotik === EstadoServicioMikrotik.SUSPENDIDO ||
-        shouldBeSuspended
-      ) {
-        await this.sshMikrotikService.removeIpFromSuspendedListByRouterId(
-          mkAntes,
-          ipAntes,
-        );
-      }
-    }
-
-    // 3) Caso: antes NO tenía Mikrotik y ahora SÍ tiene
-    if (!mkAntes && mkDespues && ipDespues) {
-      this.logger.log(
-        `Cliente ${after.id} ahora tiene Mikrotik asignado (null -> ${mkDespues}).`,
-      );
-
-      if (shouldBeSuspended) {
-        // El cliente en BD está marcado como SUSPENDIDO => lo enviamos a lista del nuevo router
-        const comment = `crm-suspendido-${after.id}`;
-        await this.sshMikrotikService.addIpToSuspendedListByRouterId(
-          mkDespues,
-          ipDespues,
-          comment,
-        );
-      }
-    }
-
-    // 4) Caso: cambia de un Mikrotik a otro diferente
-    if (mkAntes && mkDespues && mkAntes !== mkDespues) {
-      this.logger.log(
-        `Cliente ${after.id} ha cambiado de Mikrotik ${mkAntes} -> ${mkDespues}.`,
-      );
-
-      // Si tiene IP anterior, limpiamos en el router viejo
-      if (ipAntes) {
-        await this.sshMikrotikService.removeIpFromSuspendedListByRouterId(
-          mkAntes,
-          ipAntes,
-        );
-      }
-
-      // Si debe seguir suspendido y tiene IP nueva, lo agregamos en el router nuevo
-      if (shouldBeSuspended && ipDespues) {
-        const comment = `crm-suspendido-${after.id}`;
-        await this.sshMikrotikService.addIpToSuspendedListByRouterId(
-          mkDespues,
-          ipDespues,
-          comment,
-        );
-      }
-    }
-  }
-
-  /**
-   * Sincroniza el estadoServicioMikrotik de un cliente en base a:
-   * - su estadoCliente
-   * - si tiene Mikrotik asignado o no
-   *
-   * Puede usar una transacción (tx) o el prisma global.
-   * Permite pasar overrides ya conocidos (estadoCliente, mikrotikRouterId) para evitar un SELECT extra.
-   */
-  async syncEstadoServicioMikrotik(opts: {
-    tx?: Prisma.TransactionClient;
-    clienteId: number;
-    estadoCliente?: EstadoCliente;
-    mikrotikRouterId?: number | null;
-  }) {
-    const { tx, clienteId } = opts;
-    const prisma = tx ?? this.prisma;
-
-    const clienteDb = await prisma.clienteInternet.findUnique({
-      where: { id: clienteId },
-      select: {
-        estadoCliente: true,
-        mikrotikRouterId: true,
-        estadoServicioMikrotik: true,
-      },
-    });
-
-    if (!clienteDb) {
-      throw new Error('Cliente no encontrado al sincronizar estado Mikrotik');
-    }
-
-    const estadoCliente = opts.estadoCliente ?? clienteDb.estadoCliente;
-    const mikrotikRouterId =
-      opts.mikrotikRouterId ?? clienteDb.mikrotikRouterId;
-    const estadoServicioActual = clienteDb.estadoServicioMikrotik;
-
-    const nuevoEstado = calcularEstadoServicioMikrotik({
-      estadoCliente,
-      mikrotikRouterId,
-      estadoServicioActual,
-    });
-
-    if (nuevoEstado === estadoServicioActual) {
-      return;
-    }
-
-    await prisma.clienteInternet.update({
-      where: { id: clienteId },
-      data: {
-        estadoServicioMikrotik: nuevoEstado,
-      },
+      return { clienteBefore, clienteAfter, updatedCliente };
     });
   }
 
-  async verifyIsSuspended(id: number) {
+  // HELPER
+  async findWithNetwork(clienteId: number) {
     try {
-      const clienteInternet = await this.prisma.clienteInternet.findUnique({
+      const customer = await this.prisma.clienteInternet.findUnique({
         where: {
-          id,
+          id: clienteId,
         },
         select: {
-          IP: {
-            select: {
-              id: true,
-              direccionIp: true,
-            },
-          },
+          id: true,
+          estadoCliente: true,
           MikrotikRouter: {
             select: {
               id: true,
-              host: true,
-              sshPort: true,
-              usuario: true,
-              passwordEnc: true,
             },
           },
+          IP: true,
         },
       });
-
-      const password = this.mkCrypto.decrypt(
-        clienteInternet.MikrotikRouter.passwordEnc,
-      );
-
-      const config = {
-        host: clienteInternet.MikrotikRouter.host,
-        port: clienteInternet.MikrotikRouter.sshPort,
-        username: clienteInternet.MikrotikRouter.usuario,
-        password: password,
-      };
-
-      const isSuspended =
-        await this.sshMikrotikService.isCustomerSuspendedInMikrotik(
-          config,
-          clienteInternet.IP.direccionIp,
-        );
-
-      return isSuspended;
+      return customer;
     } catch (error) {
-      throwFatalError(error, this.logger, 'ClienteInternet -verifyIp');
+      throwFatalError(error, this.logger, 'findWithNetwork');
     }
   }
 }
