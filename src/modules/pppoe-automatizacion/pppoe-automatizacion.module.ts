@@ -39,10 +39,30 @@ import { PppoeOperacionAdminController } from './presentation/pppoe-operacion-ad
 import { AuthModule } from 'src/auth/auth.module';
 import { PpoeAccesoInternetModule } from '../pppoe-acceso-internet/ppoe-acceso-internet.module';
 import { PppoeCuentaAccionesController } from './presentation/pppoe-cuenta-acciones.controller';
+import { CrearPrealtaPppoeClienteUseCase } from './application/use-cases/crear-prealta-pppoe-cliente.use-case';
+import { ProvisionarPppoeClienteManualUseCase } from './application/use-cases/provisionar-pppoe-cliente-manual.use-case';
+import { PppoeCuentaProvisionamientoAdminService } from './application/services/pppoe-cuenta-provisionamiento-admin.service';
+import { PppoeCuentaProvisionamientoController } from './presentation/pppoe-cuenta-provisionamiento.controller';
+
+import { PrismaModule } from 'src/prisma/prisma.module';
+
+import { VerificarAdopcionPppoeUseCase } from './application/use-cases/verificar-adopcion-pppoe.use-case';
+
+import { PPPOE_ADOPCION_PERSISTENCE_PORT } from './domain/ports/pppoe-adopcion-persistence.port';
+
+import { PppoeAdopcionPrismaPersistence } from './infra/prisma/pppoe-adopcion-prisma.persistence';
+import { AdoptarCuentaPppoeExistenteUseCase } from './application/use-cases/adoptar-cuenta-pppoe-existente.use-case';
+import { PppoeCuentaAdopcionController } from './presentation/pppoe-cuenta-adopcion.controller';
 
 @Module({
-  controllers: [PppoeOperacionAdminController, PppoeCuentaAccionesController],
+  controllers: [
+    PppoeCuentaAdopcionController,
+    PppoeOperacionAdminController,
+    PppoeCuentaAccionesController,
+    PppoeCuentaProvisionamientoController,
+  ],
   imports: [
+    PrismaModule,
     AuthModule,
     PppoePerfilHomologacionModule,
     PppoeOperacionModule,
@@ -56,11 +76,18 @@ import { PppoeCuentaAccionesController } from './presentation/pppoe-cuenta-accio
   ],
 
   providers: [
+    AdoptarCuentaPppoeExistenteUseCase,
     /*
      * Prealta y consultas
      */
     PrepararPrealtaPppoeUseCase,
     ConsultarCredencialesPppoeInstalacionUseCase,
+
+    /*
+     * Adopción de cuentas existentes
+     */
+    VerificarAdopcionPppoeUseCase,
+    PppoeAdopcionPrismaPersistence,
 
     /*
      * Servicios internos
@@ -69,6 +96,8 @@ import { PppoeCuentaAccionesController } from './presentation/pppoe-cuenta-accio
     ResolverContextoEjecucionPppoeService,
     PppoeOperacionStepRunnerService,
     PppoeOperacionAuditoriaService,
+    PppoeProvisionamientoService,
+    PppoeCuentaProvisionamientoAdminService,
 
     /*
      * Ejecutores SSH
@@ -77,6 +106,7 @@ import { PppoeCuentaAccionesController } from './presentation/pppoe-cuenta-accio
     ActivarSecretPppoeExecutor,
     SuspenderServicioPppoeExecutor,
     EliminarSecretPppoeExecutor,
+
     /*
      * Orquestación
      */
@@ -86,30 +116,37 @@ import { PppoeCuentaAccionesController } from './presentation/pppoe-cuenta-accio
     CrearYEjecutarSuspensionPppoeUseCase,
     RecuperarPppoeOperacionInterrumpidaUseCase,
     CrearYEjecutarEliminacionPppoeUseCase,
+    ProvisionarPppoeClienteManualUseCase,
 
     /*
-     * Fachada pública
+     * Tokens / fachadas
      */
-    PppoeProvisionamientoService,
+    CrearPrealtaPppoeClienteUseCase,
 
-    /*
-     * Tokens
-     */
     {
       provide: PPPOE_PREALTA,
       useExisting: PrepararPrealtaPppoeUseCase,
     },
+
     {
       provide: PPPOE_CREDENCIALES_INSTALACION,
       useExisting: ConsultarCredencialesPppoeInstalacionUseCase,
     },
+
     {
       provide: PPPOE_PROVISIONAMIENTO,
       useExisting: PppoeProvisionamientoService,
     },
+
     {
       provide: PPPOE_OPERACION_AUDITORIA,
       useExisting: PppoeOperacionAuditoriaService,
+    },
+
+    {
+      provide: PPPOE_ADOPCION_PERSISTENCE_PORT,
+
+      useExisting: PppoeAdopcionPrismaPersistence,
     },
   ],
 
