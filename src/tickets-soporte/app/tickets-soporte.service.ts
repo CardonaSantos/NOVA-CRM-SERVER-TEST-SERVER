@@ -36,6 +36,10 @@ import { query } from 'express';
 import { TZ } from 'src/Utils/tzgt';
 import { TicketFirmaTipo } from 'src/modules/ticket-soporte-conformidad/domain/enums/ticket-firma-tipo.enum';
 import { FirebasePushService } from 'src/push-notifications/infra/firebase-push.service';
+import {
+  TicketHistorialCambio,
+  TicketSoporteHistorialPrismaTxBridge,
+} from 'src/modules/ticket-soporte-historial';
 // import { dayjs } from '';
 
 @Injectable()
@@ -57,11 +61,11 @@ export class TicketsSoporteService {
       return;
     }
 
-    if (this.estadosConFlujoDedicado.has(estadoSolicitado)) {
-      throw new BadRequestException(
-        `El cambio de estado ${estadoActual} → ${estadoSolicitado} debe realizarse mediante su flujo dedicado.`,
-      );
-    }
+    // if (this.estadosConFlujoDedicado.has(estadoSolicitado)) {
+    //   throw new BadRequestException(
+    //     `El cambio de estado ${estadoActual} → ${estadoSolicitado} debe realizarse mediante su flujo dedicado.`,
+    //   );
+    // }
   }
 
   // NUEVOS HELPERS
@@ -336,6 +340,8 @@ export class TicketsSoporteService {
     private readonly ticketResumen: TicketResumenService,
 
     private readonly firebasePush: FirebasePushService,
+
+    private readonly ticketHistorialTx: TicketSoporteHistorialPrismaTxBridge,
   ) {}
 
   // ===================== CREATE =====================
@@ -753,65 +759,122 @@ export class TicketsSoporteService {
   // Obtener todos los tickets con sus detalles y comentarios
   async getTickets(query: QuerySearchTickets) {
     try {
+      // =====================================================
+      // ESTADOS POR VISTA
+      // =====================================================
+      //
+      // Centralizamos los estados para evitar diferencias
+      // entre:
+      //
+      // - los tickets que muestra cada tab
+      // - el contador mostrado por cada tab
+      //
+      // =====================================================
+
+      const estadosResueltos: EstadoTicketSoporte[] = [
+        EstadoTicketSoporte.RESUELTA,
+        EstadoTicketSoporte.CERRADO,
+      ];
+
+      const estadosEnProceso: EstadoTicketSoporte[] = [
+        EstadoTicketSoporte.EN_PROCESO,
+        EstadoTicketSoporte.PENDIENTE,
+        EstadoTicketSoporte.PENDIENTE_CLIENTE,
+        EstadoTicketSoporte.PENDIENTE_TECNICO,
+        EstadoTicketSoporte.PENDIENTE_REVISION,
+      ];
+
+      const estadosCancelados: EstadoTicketSoporte[] = [
+        EstadoTicketSoporte.CANCELADA,
+      ];
+
+      const estadosFueraDeInbox: EstadoTicketSoporte[] = [
+        ...estadosResueltos,
+        EstadoTicketSoporte.ARCHIVADA,
+        ...estadosCancelados,
+      ];
+
+      // =====================================================
+      // FILTRO BASE SEGÚN LA TAB SELECCIONADA
+      // =====================================================
+
       const baseWhere: Prisma.TicketSoporteWhereInput = (() => {
         switch (query.vista) {
+          // =================================================
+          // RESUELTOS
+          // =================================================
           case 'lista':
             return {
               estado: {
-                in: [EstadoTicketSoporte.RESUELTA, EstadoTicketSoporte.CERRADO],
+                in: estadosResueltos,
               },
             };
 
+          // =================================================
+          // EN PROCESO
+          // =================================================
           case 'enProceso':
             return {
               estado: {
-                in: [
-                  EstadoTicketSoporte.EN_PROCESO,
-                  EstadoTicketSoporte.PENDIENTE,
-                  EstadoTicketSoporte.PENDIENTE_CLIENTE,
-                  EstadoTicketSoporte.PENDIENTE_TECNICO,
-                  EstadoTicketSoporte.PENDIENTE_REVISION,
-                ],
+                in: estadosEnProceso,
               },
             };
 
-          case 'archivados':
+          // =================================================
+          // CANCELADOS
+          // =================================================
+          case 'cancelados':
             return {
               estado: {
-                in: [
-                  EstadoTicketSoporte.ARCHIVADA,
-                  EstadoTicketSoporte.CANCELADA,
-                ],
+                in: estadosCancelados,
               },
             };
 
+          // =================================================
+          // TODOS / INBOX
+          // =================================================
           case 'inbox':
           default:
             return {
               estado: {
-                notIn: [
-                  EstadoTicketSoporte.RESUELTA,
-                  EstadoTicketSoporte.CERRADO,
-                  EstadoTicketSoporte.ARCHIVADA,
-                  EstadoTicketSoporte.CANCELADA,
-                ],
+                notIn: estadosFueraDeInbox,
               },
             };
         }
       })();
 
+      // =====================================================
+      // BÚSQUEDA POR ID
+      // =====================================================
+
       const searchID = Number(query.search);
 
       // =====================================================
       // FILTROS QUE NECESITAN OR
+      // =====================================================
       //
       // Los dejamos dentro de AND para poder combinar:
+      //
       // - búsqueda
-      // - técnico principal/adicional
+      // - técnico principal
+      // - técnico adicional
+      //
       // sin que un OR reemplace al otro.
+      //
       // =====================================================
 
       const andFilters: Prisma.TicketSoporteWhereInput[] = [];
+
+      // =====================================================
+      // FILTRO POR TÉCNICO
+      // =====================================================
+      //
+      // Puede ser:
+      //
+      // - técnico principal
+      // - técnico adicional
+      //
+      // =====================================================
 
       if (query.tecs?.length) {
         andFilters.push({
@@ -833,6 +896,10 @@ export class TicketsSoporteService {
           ],
         });
       }
+
+      // =====================================================
+      // FILTRO DE BÚSQUEDA
+      // =====================================================
 
       if (query.search) {
         andFilters.push({
@@ -871,12 +938,24 @@ export class TicketsSoporteService {
         });
       }
 
+      // =====================================================
+      // WHERE FINAL
+      // =====================================================
+
       const where: Prisma.TicketSoporteWhereInput = {
         ...baseWhere,
+
+        // ===================================================
+        // CREADO POR
+        // ===================================================
 
         ...(query.creadosPor && {
           creadoPorId: query.creadosPor,
         }),
+
+        // ===================================================
+        // SECTOR
+        // ===================================================
 
         ...(query.sector && {
           cliente: {
@@ -885,6 +964,10 @@ export class TicketsSoporteService {
             },
           },
         }),
+
+        // ===================================================
+        // ETIQUETAS
+        // ===================================================
 
         ...(query.tags?.length && {
           etiquetas: {
@@ -896,6 +979,10 @@ export class TicketsSoporteService {
           },
         }),
 
+        // ===================================================
+        // FECHA
+        // ===================================================
+
         ...(query.fechaInicio &&
           query.fechaFin && {
             fechaApertura: {
@@ -904,15 +991,36 @@ export class TicketsSoporteService {
             },
           }),
 
+        // ===================================================
+        // FILTROS OR AGRUPADOS
+        // ===================================================
+
         ...(andFilters.length > 0 && {
           AND: andFilters,
         }),
       };
 
-      this.logger.log(`Where:\n${JSON.stringify(query, null, 2)}`);
+      this.logger.log(
+        `Where:\n${JSON.stringify(
+          {
+            query,
+            where,
+          },
+          null,
+          2,
+        )}`,
+      );
+
+      // =====================================================
+      // PAGINACIÓN
+      // =====================================================
 
       const page = query.page ?? 1;
       const limit = query.limit ?? 10;
+
+      // =====================================================
+      // CONSULTAS
+      // =====================================================
 
       const [
         tickets,
@@ -920,7 +1028,12 @@ export class TicketsSoporteService {
         ticketsDisponibles,
         ticketEnProceso,
         ticketsResueltos,
+        ticketsCancelados,
       ] = await Promise.all([
+        // ===================================================
+        // LISTADO ACTUAL
+        // ===================================================
+
         this.prisma.ticketSoporte.findMany({
           where,
 
@@ -950,12 +1063,20 @@ export class TicketsSoporteService {
 
             fijado: true,
 
+            // =================================================
+            // TÉCNICO PRINCIPAL
+            // =================================================
+
             tecnico: {
               select: {
                 id: true,
                 nombre: true,
               },
             },
+
+            // =================================================
+            // TÉCNICOS ADICIONALES
+            // =================================================
 
             asignaciones: {
               select: {
@@ -969,6 +1090,10 @@ export class TicketsSoporteService {
               },
             },
 
+            // =================================================
+            // CREADOR
+            // =================================================
+
             creadoPor: {
               select: {
                 id: true,
@@ -976,6 +1101,10 @@ export class TicketsSoporteService {
                 rol: true,
               },
             },
+
+            // =================================================
+            // CLIENTE
+            // =================================================
 
             cliente: {
               select: {
@@ -995,6 +1124,10 @@ export class TicketsSoporteService {
             fechaResolucionTecnico: true,
             fechaCierre: true,
 
+            // =================================================
+            // ETIQUETAS
+            // =================================================
+
             etiquetas: {
               select: {
                 etiqueta: {
@@ -1005,6 +1138,10 @@ export class TicketsSoporteService {
                 },
               },
             },
+
+            // =================================================
+            // SEGUIMIENTO
+            // =================================================
 
             SeguimientoTicket: {
               select: {
@@ -1028,6 +1165,10 @@ export class TicketsSoporteService {
               },
             },
 
+            // =================================================
+            // LOGS DE TIEMPO
+            // =================================================
+
             logsTiempo: {
               select: {
                 id: true,
@@ -1036,6 +1177,10 @@ export class TicketsSoporteService {
                 duracionMinutos: true,
               },
             },
+
+            // =================================================
+            // RESUMEN
+            // =================================================
 
             resumen: {
               select: {
@@ -1059,31 +1204,65 @@ export class TicketsSoporteService {
           },
         }),
 
+        // ===================================================
+        // TOTAL DE LA VISTA ACTUAL
+        // ===================================================
+        //
+        // Este count sí usa todos los filtros actuales.
+        //
+        // Sirve para la paginación.
+        //
+        // ===================================================
+
         this.prisma.ticketSoporte.count({
           where,
         }),
 
+        // ===================================================
+        // CONTADOR: TODOS / INBOX
+        // ===================================================
+
         this.prisma.ticketSoporte.count({
           where: {
             estado: {
-              notIn: [
-                EstadoTicketSoporte.CERRADO,
-                EstadoTicketSoporte.CANCELADA,
-                EstadoTicketSoporte.RESUELTA,
-              ],
+              notIn: estadosFueraDeInbox,
             },
           },
         }),
 
-        this.prisma.ticketSoporte.count({
-          where: {
-            estado: EstadoTicketSoporte.EN_PROCESO,
-          },
-        }),
+        // ===================================================
+        // CONTADOR: EN PROCESO
+        // ===================================================
 
         this.prisma.ticketSoporte.count({
           where: {
-            estado: EstadoTicketSoporte.RESUELTA,
+            estado: {
+              in: estadosEnProceso,
+            },
+          },
+        }),
+
+        // ===================================================
+        // CONTADOR: RESUELTOS
+        // ===================================================
+
+        this.prisma.ticketSoporte.count({
+          where: {
+            estado: {
+              in: estadosResueltos,
+            },
+          },
+        }),
+
+        // ===================================================
+        // CONTADOR: CANCELADOS
+        // ===================================================
+
+        this.prisma.ticketSoporte.count({
+          where: {
+            estado: {
+              in: estadosCancelados,
+            },
           },
         }),
       ]);
@@ -1109,7 +1288,9 @@ export class TicketsSoporteService {
         >();
 
         for (const { tecnico } of ticket.asignaciones) {
-          // Evitar mostrar al principal también como acompañante.
+          // Evitar mostrar al técnico principal también
+          // como acompañante.
+
           if (ticket.tecnico?.id === tecnico.id) {
             continue;
           }
@@ -1125,6 +1306,7 @@ export class TicketsSoporteService {
 
         // ===================================================
         // TIEMPO TÉCNICO ACTUAL
+        // ===================================================
         //
         // Logs cerrados:
         //   duracionMinutos
@@ -1132,8 +1314,9 @@ export class TicketsSoporteService {
         // Log actualmente abierto:
         //   inicio -> ahora
         //
-        // Esto permite que el valor mostrado sea realmente
-        // "live" mientras el ticket está EN_PROCESO.
+        // Esto permite mantener el valor "live" mientras
+        // el ticket se encuentra trabajando.
+        //
         // ===================================================
 
         const tiempoTecnicoLive = ticket.logsTiempo.reduce((total, log) => {
@@ -1149,16 +1332,25 @@ export class TicketsSoporteService {
           return total + (log.duracionMinutos ?? 0);
         }, 0);
 
-        /*
-         * Una vez cerrado, TicketResumen es la fuente
-         * histórica consolidada.
-         *
-         * Mientras siga abierto, calculamos desde logs.
-         */
+        // ===================================================
+        // MÉTRICAS CONSOLIDADAS
+        // ===================================================
+        //
+        // Una vez que existe TicketResumen, utilizamos
+        // sus valores históricos.
+        //
+        // Mientras no exista, calculamos desde los logs.
+        //
+        // ===================================================
+
         const tiempoTecnicoDisplay =
           ticket.resumen?.tiempoTecnicoMinutos ?? tiempoTecnicoLive;
 
         const tiempoTotalDisplay = ticket.resumen?.tiempoTotalMinutos ?? null;
+
+        // ===================================================
+        // RESPUESTA DEL TICKET
+        // ===================================================
 
         return {
           id: ticket.id,
@@ -1203,6 +1395,10 @@ export class TicketsSoporteService {
                 rol: 'SISTEMA',
               },
 
+          // =================================================
+          // CLIENTE
+          // =================================================
+
           customer: ticket.cliente
             ? {
                 id: ticket.cliente.id,
@@ -1228,6 +1424,10 @@ export class TicketsSoporteService {
             ticket.fechaResolucionTecnico?.toISOString() ?? null,
 
           closedAt: ticket.fechaCierre?.toISOString() ?? null,
+
+          // =================================================
+          // LEÍDO / NO LEÍDO
+          // =================================================
 
           unread: ticket.estado === EstadoTicketSoporte.ABIERTA,
 
@@ -1275,6 +1475,7 @@ export class TicketsSoporteService {
                 },
 
             text: comment.descripcion,
+
             date: comment.fechaRegistro.toISOString(),
           })),
 
@@ -1283,18 +1484,14 @@ export class TicketsSoporteService {
           // =================================================
 
           metrics: {
-            /*
-             * Tiempo realmente trabajado según
-             * TicketTimeLog.
-             */
+            // Tiempo realmente trabajado según TicketTimeLog.
+
             timeSpentMinutes: tiempoTecnicoDisplay,
 
-            /*
-             * Duración calendario apertura -> cierre.
-             *
-             * Sólo existe como consolidado cuando
-             * el ticket fue cerrado.
-             */
+            // Duración calendario apertura -> cierre.
+            //
+            // Utilizamos el valor consolidado cuando existe.
+
             totalElapsedMinutes: tiempoTotalDisplay,
 
             logsCount: ticket.logsTiempo.length,
@@ -1315,8 +1512,17 @@ export class TicketsSoporteService {
         };
       });
 
+      // =====================================================
+      // PAGINACIÓN FINAL
+      // =====================================================
+
       const total = counts;
+
       const totalPages = Math.ceil(total / limit);
+
+      // =====================================================
+      // RESPONSE
+      // =====================================================
 
       return {
         data: ticketsFormateados,
@@ -1325,15 +1531,18 @@ export class TicketsSoporteService {
           ticketsDisponibles,
           ticketEnProceso,
           ticketsResueltos,
+          ticketsCancelados,
         },
 
         meta: {
           page,
           limit,
+
           total,
           totalPages,
 
           hasNextPage: page < totalPages,
+
           hasPrevPage: page > 1,
         },
       };
@@ -1351,25 +1560,36 @@ export class TicketsSoporteService {
     this.logger.debug('ID Actualización: ', id);
 
     this.logger.log(
-      `UpdateTicketsSoporteDto: \n${JSON.stringify(
+      `UpdateTicketsSoporteDto:\n${JSON.stringify(
         updateTicketsSoporteDto,
         null,
         2,
       )}`,
     );
 
-    /*
+    /**
      * =======================================================
      * TRANSACTION
      * =======================================================
      *
-     * Aquí únicamente hacemos trabajo persistente.
+     * Todo cambio persistente ocurre aquí:
      *
-     * Socket.IO se ejecutará después del COMMIT.
+     * - TicketSoporte
+     * - etiquetas
+     * - asignaciones secundarias
+     * - historial
+     *
+     * Si cualquiera falla:
+     * ROLLBACK completo.
+     *
+     * Socket.IO / Push permanecen fuera de la transacción.
      * =======================================================
      */
-
     const transactionResult = await this.prisma.$transaction(async (tx) => {
+      // ===================================================
+      // SNAPSHOT ANTERIOR
+      // ===================================================
+
       const ticketActual = await tx.ticketSoporte.findUnique({
         where: {
           id,
@@ -1378,21 +1598,28 @@ export class TicketsSoporteService {
         select: {
           id: true,
 
+          titulo: true,
+          descripcion: true,
+
           estado: true,
+          prioridad: true,
+
+          fijado: true,
 
           tecnicoId: true,
-
           clienteId: true,
 
           fechaAsignacion: true,
 
-          /*
-           * Necesitamos conocer los IDs, no solamente
-           * cuántas asignaciones existen.
-           */
           asignaciones: {
             select: {
               tecnicoId: true,
+            },
+          },
+
+          etiquetas: {
+            select: {
+              etiquetaId: true,
             },
           },
         },
@@ -1403,13 +1630,43 @@ export class TicketsSoporteService {
       }
 
       // ===================================================
-      // ESTADO
+      // ACTOR DEL CAMBIO
       // ===================================================
 
-      this.validarCambioEstadoGeneral(
-        ticketActual.estado,
-        updateTicketsSoporteDto.status,
-      );
+      const actorUsuarioId = updateTicketsSoporteDto.userId ?? null;
+
+      let actor: {
+        id: number;
+        nombre: string;
+      } | null = null;
+
+      if (actorUsuarioId) {
+        actor = await tx.usuario.findUnique({
+          where: {
+            id: actorUsuarioId,
+          },
+
+          select: {
+            id: true,
+            nombre: true,
+          },
+        });
+
+        if (!actor) {
+          throw new BadRequestException(
+            `El usuario actor ${actorUsuarioId} no existe.`,
+          );
+        }
+      }
+
+      // ===================================================
+      // ESTADO RESULTANTE
+      // ===================================================
+
+      const estadoResultante =
+        updateTicketsSoporteDto.status ?? ticketActual.estado;
+
+      this.validarCambioEstadoGeneral(ticketActual.estado, estadoResultante);
 
       // ===================================================
       // ASIGNACIONES ANTERIORES
@@ -1425,35 +1682,36 @@ export class TicketsSoporteService {
       ]);
 
       // ===================================================
-      // USUARIO PRINCIPAL RESULTANTE
+      // TÉCNICO PRINCIPAL RESULTANTE
       // ===================================================
       //
-      // Compatibilidad:
+      // Compatibilidad temporal:
       //
       // tecnicoId
       // assignee
       //
-      // Si ninguno fue enviado, conservamos el actual.
+      // Si ninguno fue enviado:
+      // conservamos el actual.
       // ===================================================
 
       const tecnicoPrincipalFueEnviado =
         updateTicketsSoporteDto.tecnicoId !== undefined ||
         updateTicketsSoporteDto.assignee !== undefined;
 
-      const tecnicoPrincipalId =
+      const tecnicoPrincipalSolicitado =
         updateTicketsSoporteDto.tecnicoId ??
         updateTicketsSoporteDto.assignee?.id ??
         null;
 
       const tecnicoPrincipalResultante = tecnicoPrincipalFueEnviado
-        ? tecnicoPrincipalId
+        ? tecnicoPrincipalSolicitado
         : ticketActual.tecnicoId;
 
       // ===================================================
-      // USUARIOS ADICIONALES RESULTANTES
+      // TÉCNICOS ADICIONALES RESULTANTES
       // ===================================================
       //
-      // Compatibilidad:
+      // Compatibilidad temporal:
       //
       // tecnicosAdicionales
       // companios
@@ -1472,15 +1730,12 @@ export class TicketsSoporteService {
         adicionalesRaw,
       ).filter((userId) => userId !== tecnicoPrincipalResultante);
 
-      /*
-       * Si no enviaron compañeros, conservamos los
-       * anteriores.
+      /**
+       * Si la colección secundaria no fue enviada,
+       * conservamos la anterior.
        *
-       * Sin embargo quitamos al nuevo principal de la
-       * colección secundaria para mantener el invariante:
-       *
-       * un usuario no puede ser principal y adicional
-       * simultáneamente.
+       * Pero si un acompañante pasó a ser principal,
+       * lo quitamos de los adicionales.
        */
       const adicionalesResultantes = adicionalesFueronEnviados
         ? adicionalesSolicitados
@@ -1499,24 +1754,108 @@ export class TicketsSoporteService {
       );
 
       // ===================================================
+      // ETIQUETAS ANTERIORES
+      // ===================================================
+
+      const etiquetasAnteriores = [
+        ...new Set(
+          ticketActual.etiquetas.map((relacion) => relacion.etiquetaId),
+        ),
+      ].sort((a, b) => a - b);
+
+      let etiquetasResultantes = [...etiquetasAnteriores];
+
+      // ===================================================
+      // NORMALIZAR Y VALIDAR ETIQUETAS
+      // ===================================================
+      //
+      // Contrato:
+      //
+      // undefined
+      // → no modificar
+      //
+      // []
+      // → eliminar todas
+      //
+      // [1, 3]
+      // → estado final = etiquetas 1 y 3
+      // ===================================================
+
+      if (updateTicketsSoporteDto.tags !== undefined) {
+        const tagIds = updateTicketsSoporteDto.tags.map((tagId) =>
+          Number(tagId),
+        );
+
+        const tieneTagInvalido = tagIds.some(
+          (tagId) => !Number.isInteger(tagId) || tagId <= 0,
+        );
+
+        if (tieneTagInvalido) {
+          this.logger.warn(
+            [
+              `Ticket ${id}`,
+              'Etiquetas inválidas',
+              `tags=${JSON.stringify(updateTicketsSoporteDto.tags)}`,
+            ].join(' | '),
+          );
+
+          throw new BadRequestException(
+            'La lista de etiquetas contiene identificadores inválidos.',
+          );
+        }
+
+        const cleanTagIds = [...new Set(tagIds)].sort((a, b) => a - b);
+
+        // ===============================================
+        // VALIDAR EXISTENCIA
+        // ===============================================
+
+        if (cleanTagIds.length > 0) {
+          const etiquetasExistentes = await tx.etiquetaTicket.findMany({
+            where: {
+              id: {
+                in: cleanTagIds,
+              },
+            },
+
+            select: {
+              id: true,
+            },
+          });
+
+          const existentesSet = new Set(
+            etiquetasExistentes.map((etiqueta) => etiqueta.id),
+          );
+
+          const noEncontradas = cleanTagIds.filter(
+            (tagId) => !existentesSet.has(tagId),
+          );
+
+          if (noEncontradas.length > 0) {
+            throw new BadRequestException(
+              `Las siguientes etiquetas no existen: ${noEncontradas.join(
+                ', ',
+              )}`,
+            );
+          }
+        }
+
+        etiquetasResultantes = cleanTagIds;
+      }
+
+      // ===================================================
       // PRIMERA ASIGNACIÓN
       // ===================================================
-      //
-      // fechaAsignacion conserva semántica histórica:
-      //
-      // primera vez en la vida del ticket que tuvo
-      // cualquier usuario asignado.
-      // ===================================================
 
-      const tieneTecnicoResultante = usuariosAsignadosDespues.length > 0;
+      const tieneAsignacionResultante = usuariosAsignadosDespues.length > 0;
 
       const fechaPrimeraAsignacion =
-        !ticketActual.fechaAsignacion && tieneTecnicoResultante
+        !ticketActual.fechaAsignacion && tieneAsignacionResultante
           ? dayjs().toDate()
           : undefined;
 
       // ===================================================
-      // UPDATE PRINCIPAL DEL TICKET
+      // UPDATE PRINCIPAL
       // ===================================================
 
       const updatedTicket = await tx.ticketSoporte.update({
@@ -1537,17 +1876,25 @@ export class TicketsSoporteService {
 
           fechaAsignacion: fechaPrimeraAsignacion,
 
+          // =============================================
+          // TÉCNICO PRINCIPAL
+          // =============================================
+
           tecnico: tecnicoPrincipalFueEnviado
-            ? tecnicoPrincipalId
+            ? tecnicoPrincipalSolicitado
               ? {
                   connect: {
-                    id: tecnicoPrincipalId,
+                    id: tecnicoPrincipalSolicitado,
                   },
                 }
               : {
                   disconnect: true,
                 }
             : undefined,
+
+          // =============================================
+          // CLIENTE
+          // =============================================
 
           cliente:
             updateTicketsSoporteDto.clienteId !== undefined
@@ -1565,35 +1912,24 @@ export class TicketsSoporteService {
       });
 
       // ===================================================
-      // ETIQUETAS
+      // PERSISTIR ETIQUETAS
       // ===================================================
 
       if (updateTicketsSoporteDto.tags !== undefined) {
-        const tagIds = updateTicketsSoporteDto.tags.map((tag) =>
-          Number(tag.value),
-        );
-
-        const tieneTagInvalido = tagIds.some(
-          (tagId) => !Number.isInteger(tagId) || tagId <= 0,
-        );
-
-        if (tieneTagInvalido) {
-          throw new BadRequestException(
-            'La lista de etiquetas contiene identificadores inválidos.',
-          );
-        }
-
-        const cleanTagIds = [...new Set(tagIds)];
-
+        /**
+         * tags representa el estado final solicitado.
+         *
+         * Reemplazamos las relaciones actuales.
+         */
         await tx.ticketEtiqueta.deleteMany({
           where: {
             ticketId: id,
           },
         });
 
-        if (cleanTagIds.length > 0) {
+        if (etiquetasResultantes.length > 0) {
           await tx.ticketEtiqueta.createMany({
-            data: cleanTagIds.map((etiquetaId) => ({
+            data: etiquetasResultantes.map((etiquetaId) => ({
               ticketId: id,
               etiquetaId,
             })),
@@ -1604,16 +1940,14 @@ export class TicketsSoporteService {
       }
 
       // ===================================================
-      // USUARIOS ADICIONALES
+      // PERSISTIR TÉCNICOS ADICIONALES
       // ===================================================
 
       if (adicionalesFueronEnviados) {
-        /*
-         * Lista explícitamente enviada:
-         *
-         * reemplazamos la colección completa.
+        /**
+         * Se recibió explícitamente la lista completa,
+         * así que reemplazamos la colección secundaria.
          */
-
         await tx.ticketSoporteTecnico.deleteMany({
           where: {
             ticketId: id,
@@ -1631,17 +1965,13 @@ export class TicketsSoporteService {
           });
         }
       } else if (tecnicoPrincipalFueEnviado && tecnicoPrincipalResultante) {
-        /*
-         * No modificaron explícitamente compañeros,
-         * pero sí cambiaron el principal.
+        /**
+         * Cambió el principal, pero no modificaron
+         * explícitamente los adicionales.
          *
-         * Si el nuevo principal anteriormente estaba
-         * como acompañante, eliminamos únicamente esa
-         * relación duplicada.
-         *
-         * Los demás acompañantes permanecen intactos.
+         * Si el nuevo principal estaba también como
+         * acompañante, quitamos esa duplicidad.
          */
-
         await tx.ticketSoporteTecnico.deleteMany({
           where: {
             ticketId: id,
@@ -1651,12 +1981,182 @@ export class TicketsSoporteService {
         });
       }
 
-      /*
-       * No emitimos todavía.
-       *
-       * Estos datos salen de la transacción y se utilizan
-       * únicamente cuando Prisma haya completado COMMIT.
-       */
+      // ===================================================
+      // CONSTRUIR AUDITORÍA
+      // ===================================================
+
+      const cambios: TicketHistorialCambio[] = [];
+
+      // ---------------------------------------------------
+      // TÍTULO
+      // ---------------------------------------------------
+
+      if (ticketActual.titulo !== updatedTicket.titulo) {
+        cambios.push({
+          campo: 'titulo',
+
+          anterior: ticketActual.titulo ?? null,
+
+          nuevo: updatedTicket.titulo ?? null,
+        });
+      }
+
+      // ---------------------------------------------------
+      // DESCRIPCIÓN
+      // ---------------------------------------------------
+
+      if (ticketActual.descripcion !== updatedTicket.descripcion) {
+        cambios.push({
+          campo: 'descripcion',
+
+          anterior: ticketActual.descripcion ?? null,
+
+          nuevo: updatedTicket.descripcion ?? null,
+        });
+      }
+
+      // ---------------------------------------------------
+      // ESTADO
+      // ---------------------------------------------------
+
+      if (ticketActual.estado !== updatedTicket.estado) {
+        cambios.push({
+          campo: 'estado',
+
+          anterior: ticketActual.estado,
+
+          nuevo: updatedTicket.estado,
+        });
+      }
+
+      // ---------------------------------------------------
+      // PRIORIDAD
+      // ---------------------------------------------------
+
+      if (ticketActual.prioridad !== updatedTicket.prioridad) {
+        cambios.push({
+          campo: 'prioridad',
+
+          anterior: ticketActual.prioridad,
+
+          nuevo: updatedTicket.prioridad,
+        });
+      }
+
+      // ---------------------------------------------------
+      // CLIENTE
+      // ---------------------------------------------------
+
+      if (ticketActual.clienteId !== updatedTicket.clienteId) {
+        cambios.push({
+          campo: 'cliente',
+
+          anterior: ticketActual.clienteId ?? null,
+
+          nuevo: updatedTicket.clienteId ?? null,
+        });
+      }
+
+      // ---------------------------------------------------
+      // TÉCNICO PRINCIPAL
+      // ---------------------------------------------------
+
+      if (ticketActual.tecnicoId !== updatedTicket.tecnicoId) {
+        cambios.push({
+          campo: 'tecnicoPrincipal',
+
+          anterior: ticketActual.tecnicoId ?? null,
+
+          nuevo: updatedTicket.tecnicoId ?? null,
+        });
+      }
+
+      // ---------------------------------------------------
+      // TÉCNICOS ADICIONALES
+      // ---------------------------------------------------
+
+      const adicionalesAntesAuditoria = [...adicionalesAnteriores].sort(
+        (a, b) => a - b,
+      );
+
+      const adicionalesDespuesAuditoria = [...adicionalesResultantes].sort(
+        (a, b) => a - b,
+      );
+
+      const adicionalesCambiaron =
+        JSON.stringify(adicionalesAntesAuditoria) !==
+        JSON.stringify(adicionalesDespuesAuditoria);
+
+      if (adicionalesCambiaron) {
+        cambios.push({
+          campo: 'tecnicosAdicionales',
+
+          anterior: adicionalesAntesAuditoria,
+
+          nuevo: adicionalesDespuesAuditoria,
+        });
+      }
+
+      // ---------------------------------------------------
+      // ETIQUETAS
+      // ---------------------------------------------------
+
+      const etiquetasCambiaron =
+        JSON.stringify(etiquetasAnteriores) !==
+        JSON.stringify(etiquetasResultantes);
+
+      if (etiquetasCambiaron) {
+        cambios.push({
+          campo: 'etiquetas',
+
+          anterior: etiquetasAnteriores,
+
+          nuevo: etiquetasResultantes,
+        });
+      }
+
+      // ---------------------------------------------------
+      // FIJADO
+      // ---------------------------------------------------
+
+      if (ticketActual.fijado !== updatedTicket.fijado) {
+        cambios.push({
+          campo: 'fijado',
+
+          anterior: ticketActual.fijado,
+
+          nuevo: updatedTicket.fijado,
+        });
+      }
+
+      // ===================================================
+      // REGISTRAR HISTORIAL
+      // ===================================================
+      //
+      // Importante:
+      // no generamos eventos si realmente nada cambió.
+      // ===================================================
+
+      if (cambios.length > 0) {
+        await this.ticketHistorialTx.registrarActualizacion(tx, {
+          ticketId: id,
+
+          actor: actor
+            ? {
+                usuarioId: actor.id,
+
+                usuarioNombre: actor.nombre,
+              }
+            : null,
+
+          cambios,
+        });
+      }
+
+      // ===================================================
+      // RESULTADO DE TRANSACCIÓN
+      // ===================================================
+
       return {
         updatedTicket,
 
@@ -1667,7 +2167,11 @@ export class TicketsSoporteService {
     });
 
     // =======================================================
-    // POST-COMMIT REALTIME
+    // POST-COMMIT REALTIME / PUSH
+    // =======================================================
+    //
+    // Estos efectos ocurren únicamente después de que
+    // PostgreSQL haya confirmado la transacción.
     // =======================================================
 
     await this.handleTicketAssignmentChanges({
@@ -1686,200 +2190,695 @@ export class TicketsSoporteService {
   // ===================== CLOSE =====================
   async closeTickets(id: number, dto: CloseTicketDto) {
     try {
-      const ticketToClose = await this.prisma.ticketSoporte.findUnique({
-        where: {
-          id,
-        },
-      });
-
       this.logger.log(`DTO CIERRE DE TICKET:\n${JSON.stringify(dto, null, 2)}`);
-
-      if (!ticketToClose) {
-        throw new NotFoundException('Ticket no encontrado');
-      }
-
-      // =====================================================
-      // FINALIZAR CICLO TÉCNICO, SI EXISTE
-      //
-      // El ticket puede cerrarse directamente por motivos
-      // administrativos/incidentes sin haber pasado por
-      // atención técnica.
-      //
-      // En ese caso NO debemos fabricar una
-      // fechaResolucionTecnico.
-      // =====================================================
-
-      const logTecnicoAbierto = await this.prisma.ticketTimeLog.findFirst({
-        where: {
-          ticketId: id,
-          fin: null,
-        },
-        select: {
-          id: true,
-        },
-      });
-
-      const tieneCicloTecnicoPorFinalizar =
-        ticketToClose.estado === EstadoTicketSoporte.EN_PROCESO ||
-        Boolean(logTecnicoAbierto);
-
-      if (tieneCicloTecnicoPorFinalizar) {
-        await this.updateStatusEnRevision(id);
-      }
 
       // =====================================================
       // INSTANTE ÚNICO DE CIERRE
+      // =====================================================
+      //
+      // El mismo instante se utiliza para:
+      //
+      // - cerrar logs técnicos abiertos;
+      // - fechaResolucionTecnico, si corresponde;
+      // - fechaCierre.
+      //
       // =====================================================
 
       const fechaCierre = dayjs().toDate();
 
       // =====================================================
-      // TIEMPO TÉCNICO
-      //
-      // Suma únicamente TicketTimeLog.
-      // Si nunca hubo trabajo técnico, será 0.
+      // TRANSACCIÓN PRINCIPAL
       // =====================================================
 
-      const tiempoTecnicoMinutos =
-        await this.ticketsRepo.obtenerTiempoTecnicoTrabajado(id);
+      const transactionResult = await this.prisma.$transaction(async (tx) => {
+        // ===============================================
+        // SNAPSHOT DEL TICKET
+        // ===============================================
 
-      // =====================================================
-      // TIEMPO TOTAL
-      //
-      // Tiempo calendario:
-      // fechaApertura -> fechaCierre
-      // =====================================================
-
-      const tiempoTotalMinutos = Math.max(
-        dayjs(fechaCierre).diff(dayjs(ticketToClose.fechaApertura), 'minutes'),
-        0,
-      );
-
-      const dtoSolucion: CreateTicketResumenDto = {
-        ticketId: id,
-        notasInternas: dto.notasInternas,
-        resueltoComo: dto.resueltoComo,
-        solucionId: dto.solucionId,
-        tiempoTotalMinutos,
-        tiempoTecnicoMinutos,
-      };
-
-      // =====================================================
-      // ETIQUETAS
-      //
-      // Sólo sincronizamos si realmente vienen en el DTO.
-      //
-      // Si no vienen, conservamos las existentes.
-      // Si viene [], significa quitar todas.
-      // =====================================================
-
-      if (dto.tags !== undefined) {
-        const etiquetaIds = dto.tags.map((tag) => Number(tag.value));
-
-        const tieneEtiquetaInvalida = etiquetaIds.some(
-          (etiquetaId) => !Number.isInteger(etiquetaId) || etiquetaId <= 0,
-        );
-
-        if (tieneEtiquetaInvalida) {
-          throw new BadRequestException(
-            'La lista de etiquetas contiene identificadores inválidos.',
-          );
-        }
-
-        const etiquetaIdsUnicos = [...new Set(etiquetaIds)];
-
-        await this.prisma.ticketEtiqueta.deleteMany({
+        const ticketActual = await tx.ticketSoporte.findUnique({
           where: {
-            ticketId: id,
+            id,
+          },
+
+          select: {
+            id: true,
+            empresaId: true,
+
+            titulo: true,
+            descripcion: true,
+
+            estado: true,
+            prioridad: true,
+
+            fijado: true,
+
+            tecnicoId: true,
+
+            fechaApertura: true,
+            fechaCierre: true,
+            fechaResolucionTecnico: true,
+
+            tecnico: {
+              select: {
+                id: true,
+                nombre: true,
+              },
+            },
+
+            asignaciones: {
+              select: {
+                tecnicoId: true,
+              },
+            },
+
+            etiquetas: {
+              select: {
+                etiquetaId: true,
+              },
+            },
+
+            logsTiempo: {
+              select: {
+                id: true,
+                inicio: true,
+                fin: true,
+                duracionMinutos: true,
+              },
+            },
+
+            resumen: {
+              select: {
+                id: true,
+                reabierto: true,
+                numeroReaperturas: true,
+                intentos: true,
+              },
+            },
           },
         });
 
-        if (etiquetaIdsUnicos.length > 0) {
-          await this.prisma.ticketEtiqueta.createMany({
-            data: etiquetaIdsUnicos.map((etiquetaId) => ({
-              ticketId: id,
-              etiquetaId,
-            })),
-            skipDuplicates: true,
+        if (!ticketActual) {
+          throw new NotFoundException(`Ticket con id ${id} no encontrado`);
+        }
+
+        // ===============================================
+        // EVITAR CIERRE DUPLICADO
+        // ===============================================
+
+        if (
+          ticketActual.estado === EstadoTicketSoporte.RESUELTA ||
+          ticketActual.estado === EstadoTicketSoporte.CERRADO
+        ) {
+          throw new BadRequestException(
+            'El ticket ya se encuentra resuelto o cerrado.',
+          );
+        }
+
+        if (ticketActual.estado === EstadoTicketSoporte.CANCELADA) {
+          throw new BadRequestException(
+            'No se puede resolver un ticket cancelado.',
+          );
+        }
+
+        // ===============================================
+        // ACTOR
+        // ===============================================
+        //
+        // CloseTicketDto actualmente tiene usuarioId.
+        //
+        // También soportamos userId como fallback porque
+        // UpdateTicketsSoporteDto lo hereda del DTO base.
+        //
+        // ===============================================
+
+        const actorUsuarioId = dto.usuarioId ?? dto.userId ?? null;
+
+        let actor: {
+          id: number;
+          nombre: string;
+        } | null = null;
+
+        if (actorUsuarioId) {
+          actor = await tx.usuario.findUnique({
+            where: {
+              id: actorUsuarioId,
+            },
+
+            select: {
+              id: true,
+              nombre: true,
+            },
+          });
+
+          if (!actor) {
+            throw new BadRequestException(
+              `El usuario actor ${actorUsuarioId} no existe.`,
+            );
+          }
+        }
+
+        // ===============================================
+        // ETIQUETAS ANTERIORES
+        // ===============================================
+
+        const etiquetasAnteriores = [
+          ...new Set(ticketActual.etiquetas.map((item) => item.etiquetaId)),
+        ].sort((a, b) => a - b);
+
+        let etiquetasResultantes = [...etiquetasAnteriores];
+
+        // ===============================================
+        // VALIDAR ETIQUETAS RESULTANTES
+        // ===============================================
+        //
+        // undefined -> conservar
+        // []        -> quitar todas
+        // [1, 3]    -> dejar exactamente 1 y 3
+        //
+        // ===============================================
+
+        if (dto.tags !== undefined) {
+          const etiquetaIds = dto.tags.map((tagId) => Number(tagId));
+
+          const tieneEtiquetaInvalida = etiquetaIds.some(
+            (etiquetaId) => !Number.isInteger(etiquetaId) || etiquetaId <= 0,
+          );
+
+          if (tieneEtiquetaInvalida) {
+            this.logger.warn(
+              [
+                `Ticket ${id}`,
+                'Etiquetas inválidas al cerrar ticket',
+                `tags=${JSON.stringify(dto.tags)}`,
+              ].join(' | '),
+            );
+
+            throw new BadRequestException(
+              'La lista de etiquetas contiene identificadores inválidos.',
+            );
+          }
+
+          etiquetasResultantes = [...new Set(etiquetaIds)].sort(
+            (a, b) => a - b,
+          );
+
+          // =============================================
+          // VALIDAR EXISTENCIA
+          // =============================================
+
+          if (etiquetasResultantes.length > 0) {
+            const existentes = await tx.etiquetaTicket.findMany({
+              where: {
+                id: {
+                  in: etiquetasResultantes,
+                },
+              },
+
+              select: {
+                id: true,
+              },
+            });
+
+            const existentesSet = new Set(
+              existentes.map((etiqueta) => etiqueta.id),
+            );
+
+            const noEncontradas = etiquetasResultantes.filter(
+              (etiquetaId) => !existentesSet.has(etiquetaId),
+            );
+
+            if (noEncontradas.length > 0) {
+              throw new BadRequestException(
+                `Las siguientes etiquetas no existen: ${noEncontradas.join(
+                  ', ',
+                )}`,
+              );
+            }
+          }
+        }
+
+        // ===============================================
+        // FINALIZAR CICLO TÉCNICO
+        // ===============================================
+        //
+        // Sustituimos la llamada externa:
+        //
+        // this.updateStatusEnRevision(id)
+        //
+        // porque queremos que:
+        //
+        // - cierre de logs;
+        // - fechaResolucionTecnico;
+        // - estado RESUELTA;
+        //
+        // formen parte de LA MISMA transacción.
+        //
+        // ===============================================
+
+        const logsAbiertos = ticketActual.logsTiempo.filter(
+          (log) => log.fin === null,
+        );
+
+        const tieneCicloTecnicoPorFinalizar =
+          ticketActual.estado === EstadoTicketSoporte.EN_PROCESO ||
+          logsAbiertos.length > 0;
+
+        const duracionesLogsAbiertos = new Map<number, number>();
+
+        for (const log of logsAbiertos) {
+          const minutosReales = dayjs(fechaCierre).diff(
+            dayjs(log.inicio),
+            'minutes',
+          );
+
+          /**
+           * Conservamos la misma regla que ya utilizaba
+           * updateStatusEnRevision:
+           *
+           * un ciclo iniciado cuenta como mínimo 1 minuto.
+           */
+          const duracionMinutos = minutosReales > 0 ? minutosReales : 1;
+
+          duracionesLogsAbiertos.set(log.id, duracionMinutos);
+
+          await tx.ticketTimeLog.update({
+            where: {
+              id: log.id,
+            },
+
+            data: {
+              fin: fechaCierre,
+              duracionMinutos,
+            },
           });
         }
-      }
 
-      // =====================================================
-      // CERRAR TICKET
-      //
-      // No reasignamos técnico durante el cierre.
-      // La asignación debe haberse realizado previamente
-      // mediante el flujo de actualización.
-      // =====================================================
+        // ===============================================
+        // TIEMPO TÉCNICO
+        // ===============================================
+        //
+        // Calculamos desde el mismo snapshot de logs.
+        //
+        // Para logs que estaban abiertos utilizamos
+        // el valor recién calculado.
+        //
+        // ===============================================
 
-      const ticketClosed = await this.prisma.ticketSoporte.update({
-        where: {
-          id,
-        },
+        const tiempoTecnicoMinutos = ticketActual.logsTiempo.reduce(
+          (total, log) => {
+            if (log.fin === null) {
+              return total + (duracionesLogsAbiertos.get(log.id) ?? 0);
+            }
 
-        data: {
-          titulo: dto.title,
-          descripcion: dto.description,
-
-          estado: EstadoTicketSoporte.RESUELTA,
-          prioridad: dto.priority,
-
-          fechaCierre,
-
-          fijado: false,
-        },
-      });
-
-      // =====================================================
-      // METAS
-      //
-      // Participantes únicos:
-      // principal + adicionales.
-      //
-      // Esto también protege datos históricos donde el
-      // principal pudiera estar repetido en asignaciones.
-      // =====================================================
-
-      const participantes = await this.prisma.ticketSoporte.findUnique({
-        where: {
-          id: ticketClosed.id,
-        },
-
-        select: {
-          tecnicoId: true,
-
-          asignaciones: {
-            select: {
-              tecnicoId: true,
-            },
+            return total + (log.duracionMinutos ?? 0);
           },
-        },
+          0,
+        );
+
+        // ===============================================
+        // TIEMPO TOTAL
+        // ===============================================
+
+        const tiempoTotalMinutos = Math.max(
+          dayjs(fechaCierre).diff(dayjs(ticketActual.fechaApertura), 'minutes'),
+          0,
+        );
+
+        // ===============================================
+        // CERRAR TICKET
+        // ===============================================
+
+        const ticketClosed = await tx.ticketSoporte.update({
+          where: {
+            id,
+          },
+
+          data: {
+            titulo: dto.title,
+
+            descripcion: dto.description,
+
+            prioridad: dto.priority,
+
+            estado: EstadoTicketSoporte.RESUELTA,
+
+            fijado: false,
+
+            fechaCierre,
+
+            /**
+             * Solamente generamos resolución técnica
+             * cuando realmente existió un ciclo
+             * técnico que finalizar.
+             *
+             * Si ya existía una fecha histórica,
+             * la conservamos.
+             */
+            fechaResolucionTecnico: tieneCicloTecnicoPorFinalizar
+              ? (ticketActual.fechaResolucionTecnico ?? fechaCierre)
+              : undefined,
+          },
+        });
+
+        // ===============================================
+        // SINCRONIZAR ETIQUETAS
+        // ===============================================
+
+        if (dto.tags !== undefined) {
+          await tx.ticketEtiqueta.deleteMany({
+            where: {
+              ticketId: id,
+            },
+          });
+
+          if (etiquetasResultantes.length > 0) {
+            await tx.ticketEtiqueta.createMany({
+              data: etiquetasResultantes.map((etiquetaId) => ({
+                ticketId: id,
+                etiquetaId,
+              })),
+
+              skipDuplicates: true,
+            });
+          }
+        }
+
+        // ===============================================
+        // RESUMEN HISTÓRICO
+        // ===============================================
+        //
+        // Antes se llamaba:
+        //
+        // this.ticketResumen.create(...)
+        //
+        // Eso utiliza otro PrismaService fuera de esta
+        // transacción.
+        //
+        // Ahora lo persistimos con el mismo tx.
+        //
+        // Además soportamos un TicketResumen existente,
+        // útil para tickets que fueron reabiertos.
+        //
+        // ===============================================
+
+        const resumenExistente = await tx.ticketResumen.findUnique({
+          where: {
+            ticketId: id,
+          },
+
+          select: {
+            id: true,
+            numeroReaperturas: true,
+            intentos: true,
+          },
+        });
+
+        if (resumenExistente) {
+          await tx.ticketResumen.update({
+            where: {
+              id: resumenExistente.id,
+            },
+
+            data: {
+              solucionId: dto.solucionId ?? null,
+
+              resueltoComo: dto.resueltoComo?.trim() || null,
+
+              notasInternas: dto.notasInternas?.trim() || null,
+
+              reabierto: false,
+
+              /**
+               * No reiniciamos:
+               *
+               * - numeroReaperturas
+               * - intentos
+               *
+               * porque contienen historia previa.
+               */
+
+              tiempoTotalMinutos,
+
+              tiempoTecnicoMinutos,
+            },
+          });
+        } else {
+          await tx.ticketResumen.create({
+            data: {
+              ticketId: id,
+
+              solucionId: dto.solucionId ?? null,
+
+              resueltoComo: dto.resueltoComo?.trim() || null,
+
+              notasInternas: dto.notasInternas?.trim() || null,
+
+              reabierto: false,
+
+              numeroReaperturas: 0,
+
+              /**
+               * TicketResumen.create() utiliza
+               * intentos = 1 como valor inicial.
+               * Conservamos esa misma semántica.
+               */
+              intentos: 1,
+
+              tiempoTotalMinutos,
+
+              tiempoTecnicoMinutos,
+            },
+          });
+        }
+
+        // ===============================================
+        // AUDITORÍA
+        // ===============================================
+
+        const cambios: TicketHistorialCambio[] = [];
+
+        // -----------------------------------------------
+        // TÍTULO
+        // -----------------------------------------------
+
+        if (ticketActual.titulo !== ticketClosed.titulo) {
+          cambios.push({
+            campo: 'titulo',
+
+            anterior: ticketActual.titulo ?? null,
+
+            nuevo: ticketClosed.titulo ?? null,
+          });
+        }
+
+        // -----------------------------------------------
+        // DESCRIPCIÓN
+        // -----------------------------------------------
+
+        if (ticketActual.descripcion !== ticketClosed.descripcion) {
+          cambios.push({
+            campo: 'descripcion',
+
+            anterior: ticketActual.descripcion ?? null,
+
+            nuevo: ticketClosed.descripcion ?? null,
+          });
+        }
+
+        // -----------------------------------------------
+        // ESTADO
+        // -----------------------------------------------
+
+        if (ticketActual.estado !== ticketClosed.estado) {
+          cambios.push({
+            campo: 'estado',
+
+            anterior: ticketActual.estado,
+
+            nuevo: ticketClosed.estado,
+          });
+        }
+
+        // -----------------------------------------------
+        // PRIORIDAD
+        // -----------------------------------------------
+
+        if (ticketActual.prioridad !== ticketClosed.prioridad) {
+          cambios.push({
+            campo: 'prioridad',
+
+            anterior: ticketActual.prioridad,
+
+            nuevo: ticketClosed.prioridad,
+          });
+        }
+
+        // -----------------------------------------------
+        // FIJADO
+        // -----------------------------------------------
+
+        if (ticketActual.fijado !== ticketClosed.fijado) {
+          cambios.push({
+            campo: 'fijado',
+
+            anterior: ticketActual.fijado,
+
+            nuevo: ticketClosed.fijado,
+          });
+        }
+
+        // -----------------------------------------------
+        // ETIQUETAS
+        // -----------------------------------------------
+
+        const etiquetasCambiaron =
+          JSON.stringify(etiquetasAnteriores) !==
+          JSON.stringify(etiquetasResultantes);
+
+        if (etiquetasCambiaron) {
+          cambios.push({
+            campo: 'etiquetas',
+
+            anterior: etiquetasAnteriores,
+
+            nuevo: etiquetasResultantes,
+          });
+        }
+
+        // ===============================================
+        // PERSISTIR AUDITORÍA
+        // ===============================================
+
+        if (cambios.length > 0) {
+          await this.ticketHistorialTx.registrarActualizacion(tx, {
+            ticketId: id,
+
+            actor: actor
+              ? {
+                  usuarioId: actor.id,
+
+                  usuarioNombre: actor.nombre,
+                }
+              : null,
+
+            cambios,
+          });
+        }
+
+        // ===============================================
+        // PARTICIPANTES PARA METAS
+        // ===============================================
+
+        const tecnicoIds = [
+          ...new Set(
+            [
+              ticketActual.tecnicoId,
+
+              ...ticketActual.asignaciones.map(
+                (asignacion) => asignacion.tecnicoId,
+              ),
+            ].filter(
+              (tecnicoId): tecnicoId is number =>
+                typeof tecnicoId === 'number' && tecnicoId > 0,
+            ),
+          ),
+        ];
+
+        return {
+          ticketClosed,
+
+          tecnicoIds,
+
+          tecnicoNombre: ticketActual.tecnico?.nombre ?? null,
+
+          tiempoTecnicoMinutos,
+
+          tiempoTotalMinutos,
+        };
       });
 
-      const tecnicoIds = new Set<number>();
+      // =====================================================
+      // POST-COMMIT: METAS
+      // =====================================================
+      //
+      // Las metas pertenecen a otro servicio/recurso y
+      // actualmente no aceptan Prisma.TransactionClient.
+      //
+      // Por eso se procesan después del COMMIT.
+      //
+      // Un fallo de una meta NO debe convertir un ticket
+      // correctamente cerrado en un cierre fallido.
+      //
+      // =====================================================
 
-      if (participantes?.tecnicoId) {
-        tecnicoIds.add(participantes.tecnicoId);
-      }
+      const resultadosMetas = await Promise.allSettled(
+        transactionResult.tecnicoIds.map((tecnicoId) =>
+          this.metasTicketSoporte.incrementMeta(tecnicoId),
+        ),
+      );
 
-      for (const asignacion of participantes?.asignaciones ?? []) {
-        tecnicoIds.add(asignacion.tecnicoId);
-      }
+      const metasFallidas = resultadosMetas.filter(
+        (resultado) => resultado.status === 'rejected',
+      );
 
-      for (const tecnicoId of tecnicoIds) {
-        await this.metasTicketSoporte.incrementMeta(tecnicoId);
+      if (metasFallidas.length > 0) {
+        this.logger.warn(
+          [
+            'Ticket cerrado, pero una o más metas no pudieron actualizarse',
+            `ticketId=${id}`,
+            `fallidas=${metasFallidas.length}`,
+          ].join(' | '),
+        );
       }
 
       // =====================================================
-      // RESUMEN HISTÓRICO
+      // POST-COMMIT: WEBSOCKET
+      // =====================================================
+      //
+      // El flujo anterior podía emitir PENDIENTE_REVISION
+      // al llamar updateStatusEnRevision(), pero no siempre
+      // emitía el estado final RESUELTA.
+      //
+      // Ahora emitimos únicamente el estado persistido.
+      //
       // =====================================================
 
-      await this.ticketResumen.create(dtoSolucion);
+      try {
+        await this.ws.sendTicketSuportChangeStatus({
+          empresaId: transactionResult.ticketClosed.empresaId,
+
+          ticketId: transactionResult.ticketClosed.id,
+
+          nuevoEstado: transactionResult.ticketClosed.estado,
+
+          titulo: transactionResult.ticketClosed.titulo,
+
+          tecnico: transactionResult.tecnicoNombre,
+        });
+      } catch (error) {
+        this.logger.warn(
+          [
+            'Ticket cerrado correctamente, pero falló la notificación WebSocket',
+            `ticketId=${id}`,
+            `error=${error instanceof Error ? error.message : String(error)}`,
+          ].join(' | '),
+        );
+      }
+
+      this.logger.log(
+        [
+          'Ticket cerrado correctamente',
+          `ticketId=${id}`,
+          `estado=${transactionResult.ticketClosed.estado}`,
+          `tiempoTecnico=${transactionResult.tiempoTecnicoMinutos}min`,
+          `tiempoTotal=${transactionResult.tiempoTotalMinutos}min`,
+        ].join(' | '),
+      );
 
       return {
         message: 'Ticket cerrado con éxito',
-        ticket: ticketClosed,
+
+        ticket: transactionResult.ticketClosed,
       };
     } catch (error) {
       this.logger.error('Error al cerrar ticket: ', error);
@@ -1898,13 +2897,22 @@ export class TicketsSoporteService {
   // ===================== DELETE =====================
   async delete(ticketId: number) {
     return await this.prisma.$transaction(async (tx) => {
-      const deletedTicket = await tx.ticketSoporte.delete({
+      const ticketCancelado = await tx.ticketSoporte.update({
         where: {
           id: ticketId,
         },
+
+        data: {
+          estado: EstadoTicketSoporte.CANCELADA,
+        },
       });
-      this.logger.debug('El ticket eliminado es: ', deletedTicket);
-      return deletedTicket;
+
+      this.logger.debug(
+        `Ticket ${ticketId} marcado como CANCELADA`,
+        ticketCancelado,
+      );
+
+      return ticketCancelado;
     });
   }
 

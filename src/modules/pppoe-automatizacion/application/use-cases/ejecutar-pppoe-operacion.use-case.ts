@@ -60,6 +60,11 @@ import { EliminarSecretPppoeExecutor } from '../executors/eliminar-secret-pppoe.
 import { CLIENTE_ACCESO_INTERNET_REPOSITORY } from 'src/modules/pppoe-acceso-internet/infra/tokens/token-ppoe-acceso-internet.token';
 import { ClienteAccesoInternetRepositoryPort } from 'src/modules/pppoe-acceso-internet/domain/ports/ppoe-acceso-internet.port';
 import { ClienteAccesoInternetEntity } from 'src/modules/pppoe-acceso-internet/domain/entities/ppoe-acceso-internet.entity';
+import {
+  CLIENTE_INTERNET_ESTADO_OPERATIVO,
+  ClienteInternetEstadoOperativoPort,
+  EstadoOperativoClienteInternet,
+} from '../../domain/ports/cliente-internet-estado-operativo.port';
 
 /**
  * Ejecuta una operación PPPoE previamente creada.
@@ -153,6 +158,9 @@ export class EjecutarPppoeOperacionUseCase {
 
     @Inject(CLIENTE_ACCESO_INTERNET_REPOSITORY)
     private readonly accesoRepository: ClienteAccesoInternetRepositoryPort,
+
+    @Inject(CLIENTE_INTERNET_ESTADO_OPERATIVO)
+    private readonly clienteEstadoOperativo: ClienteInternetEstadoOperativoPort,
   ) {}
 
   async execute(
@@ -319,6 +327,21 @@ export class EjecutarPppoeOperacionUseCase {
 
         fecha: fechaSincronizacion,
       });
+
+      /*
+       * Sincronizamos el estado operativo general
+       * del cliente únicamente después de que:
+       *
+       * - RouterOS confirmó el resultado;
+       * - ClientePppoeCuenta fue sincronizada;
+       * - ClienteAccesoInternet fue sincronizado.
+       */
+      await this.applySuccessfulClientResult({
+        operacion: aggregate.operacion,
+
+        acceso,
+      });
+
       /*
        * ======================================================
        * 5. FINALIZAR OPERACIÓN
@@ -564,6 +587,9 @@ export class EjecutarPppoeOperacionUseCase {
    * Prepara la cuenta según el tipo de operación.
    */
 
+  /**
+   * Prepara la cuenta según el tipo de operación.
+   */
   private async prepareAccountForOperation(params: {
     operacion: PppoeOperacionEntity;
 
@@ -580,11 +606,20 @@ export class EjecutarPppoeOperacionUseCase {
         return this.prepareAccountForSuspension(params.cuenta);
 
       case TipoOperacionPppoe.ELIMINAR_SECRET:
-        if (params.operacion.desinstalacionId === null) {
-          throw new ConflictException(
-            'ELIMINAR_SECRET debe estar vinculada a una desinstalación.',
-          );
-        }
+        /*
+         * ELIMINAR_SECRET puede provenir de:
+         *
+         * 1. una ClienteDesinstalacion;
+         * 2. una baja administrativa manual.
+         *
+         * La autorización funcional y la reautenticación
+         * pertenecen a los casos de uso superiores.
+         *
+         * Este motor solamente valida que la operación
+         * persistida posea un contexto estructural coherente
+         * antes de modificar el estado local o RouterOS.
+         */
+        this.assertValidDeletionContext(params.operacion);
 
         return this.prepareAccountForDeletion(params.cuenta);
 
@@ -636,6 +671,80 @@ export class EjecutarPppoeOperacionUseCase {
     }
 
     return acceso;
+  }
+
+  /**
+   * Sincroniza el estado operativo general de ClienteInternet
+   * después de confirmar exitosamente el resultado PPPoE.
+   *
+   * Importante:
+   *
+   * - ACTIVAR_SECRET -> ACTIVO
+   * - SUSPENDER_SERVICIO -> SUSPENDIDO
+   *
+   * No modifica estadoCobranza.
+   *
+   * CREAR_SECRET todavía no representa un servicio operativo.
+   *
+   * ELIMINAR_SECRET se conserva fuera de esta regla porque
+   * una baja PPPoE no equivale necesariamente, por sí sola,
+   * a completar una ClienteDesinstalacion.
+   */
+  private async applySuccessfulClientResult(params: {
+    operacion: PppoeOperacionEntity;
+
+    acceso: ClienteAccesoInternetEntity;
+  }): Promise<void> {
+    const operacion = params.operacion.toPrimitives();
+
+    switch (params.operacion.tipo) {
+      case TipoOperacionPppoe.ACTIVAR_SECRET:
+        await this.clienteEstadoOperativo.sincronizar({
+          empresaId: params.acceso.empresaId,
+
+          clienteId: params.acceso.clienteId,
+
+          estado: EstadoOperativoClienteInternet.ACTIVO,
+
+          cambiadoPorId: operacion.iniciadoPorId,
+
+          motivo: operacion.motivo,
+
+          descripcion:
+            `Estado operativo sincronizado automáticamente ` +
+            `después de confirmar la operación PPPoE ` +
+            `${operacion.id ?? 'sin-id'} ACTIVAR_SECRET.`,
+        });
+
+        return;
+
+      case TipoOperacionPppoe.SUSPENDER_SERVICIO:
+        await this.clienteEstadoOperativo.sincronizar({
+          empresaId: params.acceso.empresaId,
+
+          clienteId: params.acceso.clienteId,
+
+          estado: EstadoOperativoClienteInternet.SUSPENDIDO,
+
+          cambiadoPorId: operacion.iniciadoPorId,
+
+          motivo: operacion.motivo,
+
+          descripcion:
+            `Estado operativo sincronizado automáticamente ` +
+            `después de confirmar la operación PPPoE ` +
+            `${operacion.id ?? 'sin-id'} SUSPENDER_SERVICIO.`,
+        });
+
+        return;
+
+      case TipoOperacionPppoe.CREAR_SECRET:
+      case TipoOperacionPppoe.ELIMINAR_SECRET:
+        return;
+
+      default:
+        return;
+    }
   }
 
   /**
@@ -1258,5 +1367,68 @@ export class EjecutarPppoeOperacionUseCase {
     if (!Number.isInteger(value) || value <= 0) {
       throw new BadRequestException(`${field} debe ser un entero positivo.`);
     }
+  }
+
+  /**
+   * Valida el contexto persistido de una operación
+   * ELIMINAR_SECRET.
+   *
+   * Contextos válidos:
+   *
+   * DESINSTALACION
+   *   desinstalacionId != null
+   *
+   * BAJA_MANUAL
+   *   desinstalacionId == null
+   *   instalacionId == null
+   *
+   * Una instalación por sí sola no constituye un
+   * contexto válido para eliminar definitivamente
+   * una cuenta PPPoE.
+   *
+   * La autorización del operador no se valida aquí.
+   * Este caso de uso pertenece al motor técnico y
+   * recibe operaciones previamente creadas por los
+   * flujos de aplicación correspondientes.
+   */
+  private assertValidDeletionContext(operacion: PppoeOperacionEntity): void {
+    if (operacion.tipo !== TipoOperacionPppoe.ELIMINAR_SECRET) {
+      throw new ConflictException(
+        `La operación PPPoE ${operacion.id ?? 'sin-id'} no corresponde a ELIMINAR_SECRET.`,
+      );
+    }
+
+    /*
+     * Flujo tradicional:
+     *
+     * ClienteDesinstalacion -> ELIMINAR_SECRET
+     *
+     * Puede conservar instalacionId o no.
+     */
+    if (operacion.desinstalacionId !== null) {
+      return;
+    }
+
+    /*
+     * Baja manual:
+     *
+     * No existe ClienteInstalacion ni
+     * ClienteDesinstalacion como origen funcional.
+     */
+    if (operacion.instalacionId === null) {
+      return;
+    }
+
+    /*
+     * Contexto inconsistente:
+     *
+     * existe instalacionId pero no desinstalacionId.
+     *
+     * No admitimos que una instalación por sí sola
+     * origine una eliminación definitiva.
+     */
+    throw new ConflictException(
+      'La operación ELIMINAR_SECRET contiene un contexto inválido: una eliminación sin desinstalación no puede estar vinculada únicamente a una instalación.',
+    );
   }
 }

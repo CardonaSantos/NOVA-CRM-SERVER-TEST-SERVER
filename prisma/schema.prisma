@@ -181,6 +181,8 @@ model Usuario {
   sesionesTrackingTecnico TecnicoTrackingSesion[] @relation("TecnicoTrackingSesiones")
 
   pushDispositivos UsuarioPushDispositivo[]
+
+  ticketHistorialCambios TicketSoporteHistorial[] @relation("TicketHistorialUsuario")
 }
 
 model UsuarioPushDispositivo {
@@ -817,18 +819,17 @@ model ClienteAccesoInternet {
 model ClienteInstalacionAcceso {
   id Int @id @default(autoincrement())
 
-  instalacionId    Int
+  instalacionId    Int @unique
   accesoInternetId Int
 
   accion AccionInstalacionAcceso
 
   creadoEn DateTime @default(now())
 
-  instalacion ClienteInstalacion @relation(fields: [instalacionId], references: [id], onDelete: Cascade)
+  instalacion ClienteInstalacion @relation(fields: [instalacionId],references: [id],onDelete: Cascade)
 
-  accesoInternet ClienteAccesoInternet @relation(fields: [accesoInternetId], references: [id], onDelete: Restrict)
+  accesoInternet ClienteAccesoInternet @relation(fields: [accesoInternetId],references: [id],onDelete: Restrict)
 
-  @@unique([instalacionId, accesoInternetId])
   @@index([accesoInternetId])
 }
 
@@ -850,53 +851,42 @@ model ClientePppoeCuenta {
   estado EstadoCuentaPppoe @default(PENDIENTE_ACTIVACION)
 
   generadoPorId Int?
-
-  // NUEVO:
-  // Usuario del CRM que incorporó una cuenta
-  // que ya existía previamente en MikroTik.
   adoptadoPorId Int?
 
-  generadoEn     DateTime @default(now())
+  generadoEn     DateTime  @default(now())
   secretCreadoEn DateTime?
   activadoEn     DateTime?
   suspendidoEn   DateTime?
   eliminadoEn    DateTime?
 
-  // NUEVO:
-  // Fecha en que la cuenta preexistente fue
-  // incorporada formalmente al CRM.
-  //
-  // No representa la fecha real de creación
-  // del secret en MikroTik.
   adoptadoEn DateTime?
 
   ultimaSincronizacionEn DateTime?
-
-  ultimoError String?
+  ultimoError            String?
 
   actualizadoEn DateTime @updatedAt
 
-  empresa Empresa @relation(fields: [empresaId],references: [id],onDelete: Restrict)
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Restrict)
 
-  accesoInternet ClienteAccesoInternet @relation(fields: [accesoInternetId],references: [id],onDelete: Restrict)
+  accesoInternet ClienteAccesoInternet @relation(fields: [accesoInternetId], references: [id], onDelete: Restrict)
 
-  perfilHomologacion PppoePerfilHomologacion @relation(fields: [perfilHomologacionId],references: [id],onDelete: Restrict)
+  perfilHomologacion PppoePerfilHomologacion @relation(fields: [perfilHomologacionId], references: [id], onDelete: Restrict)
 
   generadoPor Usuario? @relation("PppoeCuentaGeneradaPor",fields: [generadoPorId],references: [id],onDelete: Restrict)
 
-  // NUEVO
   adoptadoPor Usuario? @relation("PppoeCuentaAdoptadaPor",fields: [adoptadoPorId],references: [id],onDelete: Restrict)
 
   operaciones PppoeOperacion[]
   auditorias  PppoeAuditoria[]
 
-  @@unique([empresaId, usuario])
+  /// El usuario puede repetirse entre ciclos históricos finalizados.
+  /// La unicidad de cuentas vigentes se protege en PostgreSQL mediante
+  /// un índice único parcial definido en la migración correspondiente.
+  @@index([empresaId, usuario])
 
   @@index([empresaId, estado])
   @@index([perfilHomologacionId])
   @@index([generadoPorId])
-
-  // NUEVOS
   @@index([adoptadoPorId])
   @@index([empresaId, adoptadoEn])
 }
@@ -1647,6 +1637,42 @@ model TicketSoporte {
   desinstalacionesCliente ClienteDesinstalacion[]
 
   ticketsConformidad TicketConformidad[]
+  historialCambios   TicketSoporteHistorial[]
+}
+
+model TicketSoporteHistorial {
+  id Int @id @default(autoincrement())
+
+  ticketId  Int
+  usuarioId Int?
+
+  tipo TipoCambioTicket
+
+  descripcion String?
+
+  usuarioNombre String?
+
+  creadoEn DateTime @default(now())
+
+  ticket TicketSoporte @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  usuario Usuario? @relation("TicketHistorialUsuario", fields: [usuarioId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, creadoEn])
+  @@index([usuarioId, creadoEn])
+  @@index([tipo, creadoEn])
+}
+
+enum TipoCambioTicket {
+  CREADO
+  ACTUALIZADO
+  ESTADO_CAMBIADO
+  PRIORIDAD_CAMBIADA
+  ASIGNACION_CAMBIADA
+  CANCELADO
+  REABIERTO
+  FIJADO
+  DESFIJADO
 }
 
 model TicketTimeLog {
@@ -2779,9 +2805,10 @@ model ClienteInstalacion {
   equipos          ClienteInstalacionEquipo[]
   gastosOperativos GastoOperativo[]
 
-  clienteInstalacionAccesos ClienteInstalacionAcceso[]
+  // clienteInstalacionAccesos ClienteInstalacionAcceso[]
 
   equiposAccesoAsignados ClienteAccesoEquipo[] @relation("AccesoEquipoInstalacionAsignacion")
+  clienteInstalacionAcceso ClienteInstalacionAcceso?
 
   equiposAccesoRetirados ClienteAccesoEquipo[] @relation("AccesoEquipoInstalacionRetiro")
 
@@ -3409,7 +3436,6 @@ enum AccionAuditoriaPppoe {
   HOJA_VISUALIZADA
   HOJA_GENERADA
 
-  
   // ADOPCIÓN DE CUENTAS EXISTENTES
   CUENTA_EXTERNA_VERIFICADA
   CUENTA_EXTERNA_VERIFICACION_FALLIDA
